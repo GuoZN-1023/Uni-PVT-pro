@@ -1,0 +1,108 @@
+expert_col: 'no'
+experts:
+  critical:
+    activation: gelu
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+    - 64
+  extra:
+    activation: relu
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+  gas:
+    activation: gelu
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+    - 64
+  liquid:
+    activation: silu
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+    - 64
+gate:
+  activation: relu
+  dropout: 0.05
+  hidden_layers:
+  - 512
+  - 256
+  - 128
+  - 64
+loss:
+  extreme_alpha: 4.0
+  lambda_extreme: 1.0
+  lambda_nonneg: 0
+  lambda_relative: 0.0
+  lambda_smooth: 0
+model:
+  input_dim: 8
+paths:
+  data: data/Water.csv
+  save_dir: results/2025-12-08_08-42-18
+  scaler: results/2025-12-08_08-42-18/scaler.pkl
+shap:
+  enabled: true
+target_col: phi (-)
+training:
+  batch_size: 256
+  early_stopping_patience: 20
+  epochs: 200
+  finetune_betas:
+  - 0.9
+  - 0.999
+  finetune_epochs: 100
+  finetune_optimizer: adamw
+  finetune_unfreeze:
+  - liq
+  - crit
+  finetune_weight_decay: 5.0e-05
+  gate_betas:
+  - 0.9
+  - 0.99
+  gate_optimizer: adamw
+  gate_weight_decay: 0.0001
+  lambda_entropy: -0.01
+  learning_rate: 0.0001
+  lr_schedule:
+    finetune:
+      eta_min: 1.0e-06
+      interval: epoch
+      name: cosine
+      t_max: 100
+    pretrain:
+      eta_min: 1.0e-06
+      interval: epoch
+      name: cosine
+      t_max: 200
+    stage2:
+      factor: 0.5
+      interval: epoch
+      min_lr: 1.0e-06
+      name: reduce_on_plateau
+      patience: 8
+  pretrain_epochs: 200
+  pretrain_optimizer: adam
+  pretrain_weight_decay: 0.0
+  region_weights:
+    1: 2.0
+    2: 2.8
+    3: 2.5
+    4: 1.0
+  temperature_schedule:
+    finetune:
+      end: 0.8
+      start: 1.0
+    stage2:
+      end: 0.8
+      start: 1.0
