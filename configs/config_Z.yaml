@@ -44,8 +44,14 @@ paths:
   save_dir: results/latest
   scaler: results/latest/scaler.pkl
 
-target_col: "Z (-)"
 expert_col: "no"
+
+# 你要喂给模型的输入列名（顺序就是喂入顺序）
+feature_cols: ["T_r (-)", "p_r (-)", "omega (-)", "p_c (Pa)", "T_c (K)"]
+
+# 你要预测的输出列名（可 1 个，可多个，可挑几个）
+targets: ["Z (-)", "phi (-)"]
 
 shap:
   enabled: true
+

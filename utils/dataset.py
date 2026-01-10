@@ -62,19 +62,30 @@ def apply_subset(df: pd.DataFrame, subset_cfg: dict | None,
     return df
 
 
+def _get_cfg(cfg: dict, key: str, default=None):
+    """Allow both flat config and nested `data:` config."""
+    if cfg is None:
+        return default
+    if key in cfg:
+        return cfg.get(key, default)
+    data = cfg.get("data", None)
+    if isinstance(data, dict) and key in data:
+        return data.get(key, default)
+    return default
+
+
 def infer_feature_and_target_cols(
     columns: list[str],
     anchor_col: str = "Z (-)",
     expert_col: str = "no",
 ) -> tuple[list[str], list[str]]:
     """
-    智能识别列（按用户定义的“相对位置规则”）：
+    兼容旧逻辑：基于列顺序的“锚定推断”。
 
-    - 自变量 X：在 anchor_col（默认 'Z (-)'）**之前** 的所有列（不含 anchor_col）
-    - 因变量候选 Y：从 anchor_col（含）到 expert_col（默认 'no'）之前的所有列
-      即 [anchor_col, ..., 直到 no 前一列]，不含 no
+    - 自变量 X：在 anchor_col 前的所有列（不含 anchor_col）
+    - 因变量候选 Y：从 anchor_col（含）到 expert_col 前（不含 expert_col）的所有列
 
-    该规则严格依赖 CSV 的**列顺序**（不是字母排序）。
+    注意：严格依赖 CSV 的列顺序。
     """
     cols = list(columns)
     if anchor_col not in cols:
@@ -84,7 +95,6 @@ def infer_feature_and_target_cols(
 
     i_anchor = cols.index(anchor_col)
     i_expert = cols.index(expert_col)
-
     if i_expert <= i_anchor:
         raise ValueError(
             f"Column order invalid: '{expert_col}' must appear AFTER '{anchor_col}'. "
@@ -97,9 +107,141 @@ def infer_feature_and_target_cols(
         raise ValueError("No feature columns inferred (nothing appears before anchor_col).")
     if len(target_candidate_cols) == 0:
         raise ValueError("No target columns inferred (nothing between anchor_col and expert_col).")
-
     return feature_cols, target_candidate_cols
 
+
+def resolve_columns_from_config(
+    columns: list[str],
+    cfg: dict,
+) -> tuple[list[str], list[str], str]:
+    """
+    新逻辑：显式指定 feature_cols / targets（列名），支持任意输入维度与任意多目标。
+
+    规则：
+    - expert_col（默认 'no'）必须存在，用作相区编号；不会被加入 X / Y。
+    - 若 cfg 中显式提供 feature_cols，则按该列表作为 X。
+    - 若 cfg 中显式提供 targets，则按该列表作为 Y（可多列）。
+    - 若未显式提供 feature_cols 或 targets，则回退到“锚定推断”(anchor_col) 的旧逻辑。
+    """
+    cols = list(columns)
+
+    expert_col = _get_cfg(cfg, "expert_col", "no")
+    if expert_col not in cols:
+        raise ValueError(f"Required expert/region column '{expert_col}' not found in CSV columns.")
+
+    # 读取显式配置
+    feature_cols_cfg = _get_cfg(cfg, "feature_cols", None)
+    if feature_cols_cfg is None:
+        feature_cols_cfg = _get_cfg(cfg, "features", None)
+
+    targets_cfg = _get_cfg(cfg, "targets", None)
+    if targets_cfg is None:
+        targets_cfg = _get_cfg(cfg, "target_cols", None)
+    if targets_cfg is None:
+        targets_cfg = _get_cfg(cfg, "target_col", None)
+
+    # 标准化配置形态
+    def _norm_list(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v_strip = v.strip()
+            # allow "a,b,c"
+            if "," in v_strip and v_strip.lower() not in ("all", "*"):
+                return [s.strip() for s in v_strip.split(",") if s.strip()]
+            return v_strip
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return v
+
+    feature_cols_cfg = _norm_list(feature_cols_cfg)
+    targets_cfg = _norm_list(targets_cfg)
+
+    # 如果显式给了 features/targets，就用显式；否则回退 anchor 逻辑
+    anchor_col = _get_cfg(cfg, "anchor_col", "Z (-)")
+    use_anchor_fallback = False
+    if feature_cols_cfg is None or targets_cfg is None:
+        # 只有在能够 anchor 推断时才回退，否则要求用户显式给出
+        if (anchor_col in cols) and (expert_col in cols) and (cols.index(expert_col) > cols.index(anchor_col)):
+            use_anchor_fallback = True
+        else:
+            missing = []
+            if feature_cols_cfg is None:
+                missing.append("feature_cols")
+            if targets_cfg is None:
+                missing.append("targets")
+            raise ValueError(
+                "Column selection requires explicit config when anchor-based inference is unavailable. "
+                f"Missing: {missing}. Please set them in config."
+            )
+
+    if use_anchor_fallback:
+        f_raw, t_candidates = infer_feature_and_target_cols(cols, anchor_col=anchor_col, expert_col=expert_col)
+        # feature_cols: 如果用户显式指定了则覆盖，否则使用推断
+        feature_cols = f_raw if feature_cols_cfg is None else (
+            t_candidates if isinstance(feature_cols_cfg, str) and feature_cols_cfg.lower() in ("all", "*") else feature_cols_cfg
+        )
+        # targets: 如果用户没给，则默认 all candidates；若给了 "all" 则 all candidates；否则按列表挑选
+        all_targets = list(t_candidates)
+        targets = _normalize_targets_cfg(targets_cfg, all_targets)
+    else:
+        # 显式模式
+        # 显式模式：允许 targets 或 feature_cols 使用 'all' 作为快捷方式
+        # - targets='all': 预测除 feature_cols 与 expert_col 之外的全部列
+        # - feature_cols='all': 输入除 targets 与 expert_col 之外的全部列
+        # 但不允许二者同时为 'all'（会变成循环定义）。
+        if isinstance(feature_cols_cfg, str) and feature_cols_cfg.lower() in ("all", "*") and isinstance(targets_cfg, str) and targets_cfg.lower() in ("all", "*"):
+            raise ValueError("feature_cols and targets cannot both be 'all' in explicit mode.")
+        if isinstance(feature_cols_cfg, str):
+            if feature_cols_cfg.lower() in ("all", "*"):
+                feature_cols = None  # resolve later
+            else:
+                feature_cols = [feature_cols_cfg]
+        else:
+            feature_cols = list(feature_cols_cfg) if feature_cols_cfg is not None else []
+
+        if isinstance(targets_cfg, str):
+            if targets_cfg.lower() in ("all", "*"):
+                targets = None  # resolve later
+            else:
+                targets = [targets_cfg]
+        else:
+            targets = list(targets_cfg) if targets_cfg is not None else []
+
+        # resolve shortcuts
+        if feature_cols is None and targets is None:
+            raise ValueError("feature_cols and targets cannot both be 'all' in explicit mode.")
+
+        if targets is None:
+            # all columns except features & expert_col
+            targets = [c for c in cols if c != expert_col and (feature_cols is None or c not in feature_cols)]
+        if feature_cols is None:
+            # all columns except targets & expert_col
+            feature_cols = [c for c in cols if c != expert_col and c not in targets]
+
+    # 校验：存在、无重复、并排除 expert_col
+    def _check_list(name, lst):
+        if not lst:
+            raise ValueError(f"{name} resolved to empty. Please check your config.")
+        seen = set()
+        for c in lst:
+            if c == expert_col:
+                raise ValueError(f"Column '{expert_col}' is expert_col and cannot be used as {name}.")
+            if c not in cols:
+                raise ValueError(f"Column '{c}' listed in {name} not found in CSV columns.")
+            if c in seen:
+                raise ValueError(f"Duplicate column '{c}' in {name}.")
+            seen.add(c)
+
+    _check_list("feature_cols", feature_cols)
+    _check_list("targets", targets)
+
+    # 防止 X 与 Y 重叠
+    overlap = set(feature_cols).intersection(set(targets))
+    if overlap:
+        raise ValueError(f"feature_cols and targets overlap: {sorted(overlap)}")
+
+    return feature_cols, targets, expert_col
 
 def _normalize_targets_cfg(targets_cfg, all_targets: list[str]) -> list[str]:
     """
@@ -132,8 +274,8 @@ class ZDataset(Dataset):
     自适应多任务数据集：
 
     - 读取 CSV
-    - 按“位置规则”推断特征列 X 与因变量候选列 Y
-    - 通过 config 中的 targets/target_cols/target_col 选择要预测的目标列（可 1 个或多个）
+    - 优先按 config 指定的 feature_cols / targets（列名）构建 X / y（支持任意输入维度与多目标）
+    - 若未指定 feature_cols 或 targets，可回退到旧的 anchor_col 位置规则推断（用于兼容）
     - no 列必须存在：作为相区编号 expert_id，仅用于 Stage1 专家预训练/区域加权，不进入特征
 
     __getitem__ 返回 (X, y, expert_id)
@@ -164,26 +306,20 @@ class ZDataset(Dataset):
 
         df_raw = pd.read_csv(csv_path)
 
-        # 按列顺序推断 X / Y 候选
-        feature_cols_raw, target_candidates_raw = infer_feature_and_target_cols(
-            list(df_raw.columns), anchor_col=anchor_col, expert_col=expert_col
+        # 解析列选择：优先使用 config 中的 feature_cols / targets（列名），否则回退锚定推断
+        feature_cols_raw, chosen_targets, expert_col = resolve_columns_from_config(
+            list(df_raw.columns), cfg=cfg
         )
 
-        # 选择要预测的 targets（可多目标）
-        targets_cfg = (
-            cfg.get("targets", None)
-            if "targets" in cfg
-            else cfg.get("target_cols", None)
-        )
-        if targets_cfg is None and "target_col" in cfg and isinstance(cfg.get("target_col"), str):
-            targets_cfg = cfg.get("target_col")
-        chosen_targets = _normalize_targets_cfg(targets_cfg, target_candidates_raw)
-        if len(chosen_targets) == 0:
-            raise ValueError(
-                "No valid targets selected. "
-                f"Candidates (between {anchor_col} and {expert_col}): {target_candidates_raw}. "
-                f"Your config targets: {targets_cfg}"
+        # 为了报告信息：尽量保留“候选池”；若无法推断则等于 chosen_targets
+        try:
+            _, target_candidates_raw = infer_feature_and_target_cols(
+                list(df_raw.columns),
+                anchor_col=_get_cfg(cfg, "anchor_col", "Z (-)"),
+                expert_col=expert_col,
             )
+        except Exception:
+            target_candidates_raw = list(chosen_targets)
 
         # 数值化：只保留需要的列（X + chosen_targets + expert_col）
         needed_cols = list(feature_cols_raw) + list(chosen_targets) + [expert_col]

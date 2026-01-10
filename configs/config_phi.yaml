@@ -106,8 +106,9 @@ paths:
   save_dir: results/latest
   scaler: results/latest/scaler.pkl
 
-target_col: "phi (-)"
 expert_col: "no"
+anchor_col: "Z (-)"
+targets: "phi (-)"
 
 shap:
   enabled: true

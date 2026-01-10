@@ -208,45 +208,45 @@ def main():
 
 
 
-# ---- SHAP summary plots: one per target ----
-for j, tgt in enumerate(target_cols):
-    if j >= len(shap_values_list):
-        break
-    shap_values_arr = shap_values_list[j]
-    safe = "".join(ch if ch.isalnum() else "_" for ch in str(tgt))[:80]
+    # ---- SHAP summary plots: one per target ----
+    for j, tgt in enumerate(target_cols):
+        if j >= len(shap_values_list):
+            break
+        shap_values_arr = shap_values_list[j]
+        safe = "".join(ch if ch.isalnum() else "_" for ch in str(tgt))[:80]
 
-    logger.info(f"Saving shap_summary__{safe}.png ...")
-    plt.figure(figsize=(9, 6))
-    shap.summary_plot(
-        shap_values_arr,
-        features=X_explain_np,
-        feature_names=feature_names,
-        show=False,
-    )
-    plt.tight_layout()
-    summary_png = os.path.join(shap_dir, f"shap_summary__{safe}.png")
-    plt.savefig(summary_png, dpi=300)
-    plt.close()
+        logger.info(f"Saving shap_summary__{safe}.png ...")
+        plt.figure(figsize=(9, 6))
+        shap.summary_plot(
+            shap_values_arr,
+            features=X_explain_np,
+            feature_names=feature_names,
+            show=False,
+        )
+        plt.tight_layout()
+        summary_png = os.path.join(shap_dir, f"shap_summary__{safe}.png")
+        plt.savefig(summary_png, dpi=300)
+        plt.close()
 
-    # mean(|shap|) bar CSV per target
-    mean_abs = np.mean(np.abs(shap_values_arr), axis=0)
-    df_bar = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False)
-    bar_csv = os.path.join(shap_dir, f"shap_bar__{safe}.csv")
-    df_bar.to_csv(bar_csv, index=False)
+        # mean(|shap|) bar CSV per target
+        mean_abs = np.mean(np.abs(shap_values_arr), axis=0)
+        df_bar = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False)
+        bar_csv = os.path.join(shap_dir, f"shap_bar__{safe}.csv")
+        df_bar.to_csv(bar_csv, index=False)
 
 
 
-    logger.info("Saving shap_values.csv ...")
-    feat_df = pd.DataFrame(X_explain_np, columns=[f"feat_{c}" for c in feature_names])
-    shap_df = pd.DataFrame(shap_values_arr, columns=[f"shap_{c}" for c in feature_names])
+        logger.info("Saving shap_values.csv ...")
+        feat_df = pd.DataFrame(X_explain_np, columns=[f"feat_{c}" for c in feature_names])
+        shap_df = pd.DataFrame(shap_values_arr, columns=[f"shap_{c}" for c in feature_names])
 
-    out_df = pd.concat([feat_df, shap_df], axis=1)
-    out_df["y_true"] = y_true_np
-    out_df["y_pred"] = y_pred_np
-    out_df["explainer"] = used
-    out_df.to_csv(os.path.join(shap_dir, "shap_values.csv"), index=False)
+        out_df = pd.concat([feat_df, shap_df], axis=1)
+        out_df["y_true"] = y_true_np
+        out_df["y_pred"] = y_pred_np
+        out_df["explainer"] = used
+        out_df.to_csv(os.path.join(shap_dir, "shap_values.csv"), index=False)
 
-    logger.info("SHAP analysis finished successfully.")
+        logger.info("SHAP analysis finished successfully.")
 
 
 if __name__ == "__main__":

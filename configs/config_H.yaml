@@ -106,8 +106,9 @@ paths:
   save_dir: results/latest
   scaler: results/latest/scaler.pkl
 
-target_col: "H (J/mol)"
 expert_col: "no"
+anchor_col: "Z (-)"
+targets: "H (J/mol)"
 
 shap:
   enabled: true

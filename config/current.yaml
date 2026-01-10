@@ -31,6 +31,12 @@ experts:
     - 256
     - 128
     - 64
+feature_cols:
+- T_r (-)
+- p_r (-)
+- omega (-)
+- p_c (Pa)
+- T_c (K)
 gate:
   activation: relu
   dropout: 0.05
@@ -49,11 +55,13 @@ model:
   input_dim: 8
 paths:
   data: data/Water.csv
-  save_dir: results/2026-01-10_21-23-49
-  scaler: results/2026-01-10_21-23-49/scaler.pkl
+  save_dir: results/2026-01-10_23-26-58
+  scaler: results/2026-01-10_23-26-58/scaler.pkl
 shap:
   enabled: true
-target_col: Z (-)
+targets:
+- Z (-)
+- phi (-)
 training:
   batch_size: 256
   early_stopping_patience: 20
