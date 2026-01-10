@@ -1,0 +1,32 @@
+========== RUN_ALL START ==========
+timestamp: 2026-01-10_20-42-44
+exp_dir:    /Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44
+base_config:/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/configs/config_Z.yaml
+
+===== STAGE: TRAIN =====
+
+[run_all] Running: /opt/anaconda3/envs/Uni-PVT/bin/python train.py --config results/2026-01-10_20-42-44/config_used.yaml
+[run_all]  stdout -> results/2026-01-10_20-42-44/logs/train.stdout.log
+[run_all]  stderr -> results/2026-01-10_20-42-44/logs/train.stderr.log
+[run_all] Return code: 0
+
+===== STAGE: PREDICT =====
+
+[run_all] Running: /opt/anaconda3/envs/Uni-PVT/bin/python predict.py --config results/2026-01-10_20-42-44/config_used.yaml
+[run_all]  stdout -> results/2026-01-10_20-42-44/logs/predict.stdout.log
+[run_all]  stderr -> results/2026-01-10_20-42-44/logs/predict.stderr.log
+[run_all] Return code: 0
+
+===== STAGE: SHAP (enabled=True, strict=False) =====
+
+[run_all] Running: /opt/anaconda3/envs/Uni-PVT/bin/python shap_analysis.py --config results/2026-01-10_20-42-44/config_used.yaml
+[run_all]  stdout -> results/2026-01-10_20-42-44/logs/shap.stdout.log
+[run_all]  stderr -> results/2026-01-10_20-42-44/logs/shap.stderr.log
+[run_all] Return code: 1
+[run_all] SHAP failed (rc=1). See:
+  results/2026-01-10_20-42-44/logs/shap.stderr.log
+  results/2026-01-10_20-42-44/shap/crash.log
+
+✅ RUN_ALL FINISHED
+summary.json: /Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/summary.json
+========== RUN_ALL END ==========

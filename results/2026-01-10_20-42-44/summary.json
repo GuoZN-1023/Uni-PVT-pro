@@ -1,0 +1,28 @@
+{
+  "EvalArtifacts": {
+    "metrics_summary": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/eval/metrics_summary.yaml",
+    "pred_csv": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/eval/test_predictions.csv",
+    "scatter_html": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/eval/true_vs_pred_scatter.html"
+  },
+  "RegionArtifacts": {
+    "region_scatter_html": "",
+    "region_metrics_csv": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/region_eval/region_metrics.csv",
+    "region_metrics_yaml": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/region_eval/region_metrics.yaml"
+  },
+  "RunAll": {
+    "timestamp": "2026-01-10_20-42-44",
+    "exp_dir": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44",
+    "config_used": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/config_used.yaml",
+    "run_all_log": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/logs/run_all.log",
+    "shap_enabled": true,
+    "shap_returncode": 1,
+    "logs": {
+      "train_stdout": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/logs/train.stdout.log",
+      "train_stderr": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/logs/train.stderr.log",
+      "predict_stdout": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/logs/predict.stdout.log",
+      "predict_stderr": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/logs/predict.stderr.log",
+      "shap_stdout": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/logs/shap.stdout.log",
+      "shap_stderr": "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/logs/shap.stderr.log"
+    }
+  }
+}

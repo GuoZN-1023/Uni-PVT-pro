@@ -1,16 +1,3 @@
-# pt_viz.py
-# ------------------------------------------------------------
-# chem_viz 风格的 PT 可视化：
-# 1) True vs Pred：随 P、T 的 3D 分布 + 各面投影
-# 2) Diff (Pred-True 或 |Pred-True|)：随 P、T 的 3D 分布 + 各面投影
-#
-# 重点优化：PT 平面投影的等高线/填充更“干净”
-# - 强制 P=p_r*p_c, T=T_r*T_c（优先级最高）
-# - (T, log10(P)) 空间 IDW 插值
-# - 高斯平滑抑制波纹
-# - 先填充(无边线) + 再叠少量细线(不抢戏)
-# ------------------------------------------------------------
-
 import os
 import argparse
 from typing import Dict, Tuple, Optional, List
@@ -21,7 +8,8 @@ import plotly.graph_objects as go
 import plotly.io as pio
 
 
-# 与 chem_viz 保持一致（你也可以按自己的 chem_viz 配色微调）
+# ------------------------------ 常量 ------------------------------
+
 REGION_COLORS = {1: "#E699A7", 2: "#FEDD9E", 3: "#A6D9C0", 4: "#71A7D2"}
 REGION_LABELS = {1: "气相区 (Gas)", 2: "液相区 (Liquid)", 3: "相变区 (Phase Change)", 4: "临界区 (Critical)"}
 
@@ -117,13 +105,11 @@ def compute_PT(df: pd.DataFrame) -> pd.DataFrame:
         Trv = df[Tr].astype(float).to_numpy()
         Tcv = df[Tc].astype(float).to_numpy()
 
-        # p_c 单位启发式修正（避免把 bar/MPa 当 Pa）
-        # 典型：Pa ~ 1e6~1e7；bar ~ 10~100；kPa ~ 1e3~1e4
         med_pc = float(np.nanmedian(pcv))
         if np.isfinite(med_pc) and med_pc < 1e3:
-            if med_pc < 200:      # 更像 bar
+            if med_pc < 200:    
                 pcv = pcv * 1e5
-            else:                  # 更像 kPa
+            else:                  
                 pcv = pcv * 1e3
 
         df["P"] = prv * pcv
@@ -403,12 +389,7 @@ def make_projection_pt_with_contours(
     grid_n: int = 90,
     yaxis_log: bool = True,
 ) -> go.Figure:
-    """
-    PT 平面投影（优化版）：
-    - (T, log10(P)) 空间 IDW
-    - 高斯平滑抑制波纹
-    - 先“填充无边线”再“少量细线”叠加，整体更干净
-    """
+    
     traces: List[go.BaseTraceType] = []
     LINE_COLOR = "rgba(20,20,20,0.55)"
 
@@ -441,7 +422,6 @@ def make_projection_pt_with_contours(
         ZG = idw_grid(T, logP, z, GT, GP, power=2.1, max_norm_dist=0.16)
         ZG = _gaussian_smooth_2d(ZG, sigma=1.1)
 
-        # 1) 填充（不画线）
         traces.append(
             go.Contour(
                 x=gt,
@@ -456,7 +436,6 @@ def make_projection_pt_with_contours(
             )
         )
 
-        # 2) 少量线条（注意：ncontours 必须在顶层！）
         traces.append(
             go.Contour(
                 x=gt,
@@ -472,7 +451,6 @@ def make_projection_pt_with_contours(
             )
         )
 
-        # 3) 叠加散点
         if overlay_points:
             op = normalize_to_opacity(z, min_op=0.25, max_op=0.90)
             traces.append(

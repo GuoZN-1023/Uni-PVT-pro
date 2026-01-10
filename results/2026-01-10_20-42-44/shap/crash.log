@@ -1,0 +1,9 @@
+
+========== SHAP FAILED ==========
+Traceback (most recent call last):
+  File "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/shap_analysis.py", line 227, in <module>
+    main()
+  File "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/shap_analysis.py", line 99, in main
+    import matplotlib
+ModuleNotFoundError: No module named 'matplotlib'
+

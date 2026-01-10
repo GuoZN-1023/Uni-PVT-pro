@@ -21,14 +21,14 @@ class FusionWrapper(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y, _, _ = self.fusion_model(x)
-        # 统一输出 shape=[N,1]，让 SHAP 更稳定
+
         if y.dim() == 1:
             y = y.unsqueeze(-1)
         return y
 
 
 def subset_to_xy(subset, max_samples=None, device="cpu"):
-    """从 Subset 抽样，返回 X, y（X 已标准化）。"""
+
     xs, ys = [], []
     n = len(subset)
     limit = n if max_samples is None else min(n, max_samples)
@@ -39,13 +39,13 @@ def subset_to_xy(subset, max_samples=None, device="cpu"):
         if y.numel() != 1:
             y = y[:1]
         ys.append(y)
-    X = torch.stack(xs, dim=0).to(device)          # [N, F]
-    y = torch.cat(ys, dim=0).to(device)            # [N]
+    X = torch.stack(xs, dim=0).to(device)          
+    y = torch.cat(ys, dim=0).to(device)            
     return X, y
 
 
 def _as_array(shap_values):
-    """shap 有时返回 list（多输出），回归单输出时取第一个。"""
+
     if isinstance(shap_values, list):
         arr = np.array(shap_values[0])
     else:
@@ -54,14 +54,7 @@ def _as_array(shap_values):
 
 
 def _ensure_2d_shap(arr: np.ndarray):
-    """
-    将 shap_values 规整为 (N, F)。
-    常见情况：
-      - (N, F) ✅
-      - (N, F, 1) -> squeeze -> (N, F)
-      - (1, N, F) -> squeeze(0) -> (N, F)
-      - (N, 1, F) -> squeeze(1) -> (N, F)
-    """
+
     if arr.ndim == 3 and arr.shape[-1] == 1:
         arr = arr[..., 0]
     if arr.ndim == 3 and arr.shape[0] == 1:
@@ -95,7 +88,7 @@ def main():
     logger.info(f"Config: {os.path.abspath(args.config)}")
     logger.info(f"Save dir: {shap_dir}")
 
-    # 延迟导入：确保能先写日志
+
     try:
         import shap
     except Exception:
@@ -125,14 +118,14 @@ def main():
         subset_cfg=subset_cfg,
     )
 
-    # 用真实输入维度覆盖 cfg（避免 ckpt mismatch）
+
     cfg.setdefault("model", {})
     cfg["model"]["input_dim"] = int(dataset.input_dim)
     feature_names = dataset.feature_cols
     logger.info(f"input_dim={dataset.input_dim}")
     logger.info(f"features({len(feature_names)}): {feature_names}")
 
-    # 固定 split（与训练一致）
+
     n_total = len(dataset)
     n_train = int(0.8 * n_total)
     n_val = int(0.1 * n_total)
@@ -141,7 +134,7 @@ def main():
     train_set, _, test_set = random_split(dataset, [n_train, n_val, n_test], generator=g)
     logger.info(f"Split: train={len(train_set)}, test={len(test_set)}")
 
-    # 模型 + ckpt
+
     model = FusionModel(cfg).to(device)
     ckpt_path = os.path.join(save_dir, "checkpoints", "best_model.pt")
     if not os.path.exists(ckpt_path):
@@ -192,7 +185,7 @@ def main():
     if shap_values_arr is None:
         raise RuntimeError("SHAP failed: shap_values_arr is None")
 
-    # 预测输出
+
     X_explain_np = X_explain.detach().cpu().numpy()
     y_true_np = y_explain.detach().cpu().numpy().reshape(-1)
     with torch.no_grad():
@@ -200,7 +193,7 @@ def main():
 
     logger.info(f"Explainer used: {used}, shap shape={shap_values_arr.shape}")
 
-    # summary plot
+
     logger.info("Saving shap_summary.png ...")
     plt.figure(figsize=(9, 6))
     shap.summary_plot(
@@ -214,7 +207,7 @@ def main():
     plt.savefig(summary_png, dpi=300)
     plt.close()
 
-    # csv
+
     logger.info("Saving shap_values.csv ...")
     feat_df = pd.DataFrame(X_explain_np, columns=[f"feat_{c}" for c in feature_names])
     shap_df = pd.DataFrame(shap_values_arr, columns=[f"shap_{c}" for c in feature_names])
@@ -229,7 +222,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # 不往终端输出 traceback：写入 shap/crash.log
+
     try:
         main()
         sys.exit(0)

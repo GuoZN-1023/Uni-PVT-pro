@@ -144,7 +144,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # 不往终端打印 traceback（写入 logs/run_all.log）
+
     try:
         main()
         sys.exit(0)
@@ -152,7 +152,7 @@ if __name__ == "__main__":
         raise
     except Exception:
         tb = traceback.format_exc()
-        # 尽量写到最新一次 results/*/logs/run_all.log
+
         try:
             root = "results"
             candidate = "run_all_error.log"

@@ -1,4 +1,3 @@
-# predict.py
 import os
 import argparse
 import json
@@ -45,7 +44,7 @@ def main():
     logger = get_file_logger(os.path.join(eval_dir, "eval.log"), name="eval")
     logger.info(f"Device: {device}")
 
-    # 用 train=False 加载数据，复用训练时的 scaler
+
     dataset = ZDataset(
         csv_path=data_path,
         scaler_path=scaler_path,
@@ -55,7 +54,7 @@ def main():
         subset_cfg=subset_cfg,
     )
 
-    # 让模型结构与数据维度一致
+
     cfg.setdefault("model", {})
     cfg["model"]["input_dim"] = dataset.input_dim
     logger.info(
@@ -79,13 +78,12 @@ def main():
     full_ids = dataset.expert_ids
     test_indices = np.array(test_set.indices, dtype=int)
 
-    # 对应测试集下标，提取原始数值状态（T、p 等），方便导出到 CSV
+
     df_test_states = None
     if hasattr(dataset, "num_df") and dataset.num_df is not None:
         try:
             df_test_states = dataset.num_df.iloc[test_indices].reset_index(drop=True)
         except Exception as e:
-            # 出现问题时仅在日志中提示，不影响后续评估
             logger.warning(f"Failed to slice dataset.num_df for test set: {e}")
     test_expert_ids = full_ids[test_indices]
 
@@ -131,7 +129,7 @@ def main():
     with open(os.path.join(eval_dir, "metrics_summary.yaml"), "w") as f:
         yaml.dump(metrics, f)
 
-    # 构建带有原始状态变量 + 真实/预测 Z 的测试集结果表
+
     if df_test_states is not None:
         df_pred = df_test_states.copy()
         df_pred = df_pred.reset_index(drop=True)
@@ -184,7 +182,7 @@ def main():
     scatter_path = os.path.join(eval_dir, "true_vs_pred_scatter.html")
     fig.write_html(scatter_path)
 
-    # -------- 分区域评估 --------
+
     region_metrics = []
     for eid in sorted(df_pred["expert_id"].unique()):
         df_g = df_pred[df_pred["expert_id"] == eid]
@@ -212,7 +210,6 @@ def main():
     with open(region_metrics_yaml, "w") as f:
         yaml.dump({"regions": region_metrics}, f)
 
-    # -------- 把路径写回 summary.json 方便查阅 --------
     summary_path = os.path.join(save_dir, "summary.json")
     if os.path.exists(summary_path):
         with open(summary_path, "r") as f:

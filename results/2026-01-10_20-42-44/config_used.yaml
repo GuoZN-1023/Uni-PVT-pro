@@ -1,0 +1,67 @@
+expert_col: 'no'
+experts:
+  critical:
+    activation: tanh
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+    - 64
+  extra:
+    activation: relu
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+  gas:
+    activation: gelu
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+    - 64
+  liquid:
+    activation: relu
+    dropout: 0
+    hidden_layers:
+    - 512
+    - 256
+    - 128
+    - 64
+gate:
+  activation: relu
+  dropout: 0.05
+  hidden_layers:
+  - 512
+  - 256
+  - 128
+  - 64
+loss:
+  extreme_alpha: 4.0
+  lambda_extreme: 1.0
+  lambda_nonneg: 3.079894566270446e-05
+  lambda_relative: 0.0
+  lambda_smooth: 0
+model:
+  input_dim: 9
+paths:
+  data: data/Water.csv
+  save_dir: results/2026-01-10_20-42-44
+  scaler: results/2026-01-10_20-42-44/scaler.pkl
+shap:
+  enabled: true
+target_col: Z (-)
+training:
+  batch_size: 256
+  early_stopping_patience: 20
+  epochs: 200
+  extreme_alpha: 4.0
+  lambda_extreme: 1.0
+  lambda_nonneg: 3.079894566270446e-05
+  lambda_relative: 0.0
+  lambda_smooth: 0
+  learning_rate: 0.0016875946494005715
+  pretrain_epochs: 100
