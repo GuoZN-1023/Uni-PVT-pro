@@ -529,7 +529,12 @@ def load_from_checkpoint(config_path: str, save_dir: str, split: str = "test") -
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
-    dataset = ZDataset(cfg, train=False)
+    dataset = ZDataset(
+        csv_path=cfg['paths']['data'],
+        scaler_path=cfg['paths']['scaler'],
+        cfg=cfg,
+        train=False,
+    )
 
     n_total = len(dataset)
     n_train = int(0.8 * n_total)

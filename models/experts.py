@@ -123,7 +123,7 @@ class ExpertNetwork(nn.Module):
     每一层都包含：
       Linear -> BatchNorm1d -> Activation -> Dropout -> Residual
     """
-    def __init__(self, input_dim, hidden_layers, activation: str = "relu", dropout: float = 0.0):
+    def __init__(self, input_dim, hidden_layers, activation: str = "relu", dropout: float = 0.0, output_dim: int = 1):
         super().__init__()
         if not hidden_layers:
             raise ValueError("hidden_layers must contain at least one layer size.")
@@ -145,7 +145,7 @@ class ExpertNetwork(nn.Module):
             prev_dim = h
 
         self.blocks = nn.Sequential(*blocks)
-        self.out = nn.Linear(prev_dim, 1)
+        self.out = nn.Linear(prev_dim, int(output_dim))
 
         # output init: keep regression head stable
         _init_linear(self.out, activation="linear", is_output=True)

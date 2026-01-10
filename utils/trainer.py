@@ -7,6 +7,39 @@ import pandas as pd
 import plotly.graph_objects as go
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
+def _as_2d(a: np.ndarray) -> np.ndarray:
+    a = np.asarray(a)
+    if a.ndim == 1:
+        return a.reshape(-1, 1)
+    return a
+
+
+def compute_metrics(y_true, y_pred):
+    """Return dict with per_target and mean metrics for multi-output regression."""
+    yt = _as_2d(np.asarray(y_true))
+    yp = _as_2d(np.asarray(y_pred))
+
+    # sklearn supports multioutput
+    mae_vec = mean_absolute_error(yt, yp, multioutput="raw_values")
+    mse_vec = mean_squared_error(yt, yp, multioutput="raw_values")
+    if yt.shape[0] >= 2:
+        r2_vec = r2_score(yt, yp, multioutput="raw_values")
+    else:
+        r2_vec = np.full((yt.shape[1],), np.nan, dtype=float)
+
+    out = {
+        "mae_per_target": mae_vec,
+        "mse_per_target": mse_vec,
+        "r2_per_target": r2_vec,
+        "mae": float(np.nanmean(mae_vec)),
+        "mse": float(np.nanmean(mse_vec)),
+        "r2": float(np.nanmean(r2_vec)),
+        "n": int(yt.shape[0]),
+        "t": int(yt.shape[1]),
+    }
+    return out
+
+
 
 def _set_requires_grad(params, flag: bool):
     for p in params:
@@ -218,15 +251,15 @@ def _eval_pretrain_expert_metrics(model, val_loader, device):
             for k in [1, 2, 3, 4]:
                 mask = (expert_ids == k)
                 if mask.any():
-                    yk = y[mask].detach().cpu().numpy().reshape(-1)
-                    pk = expert_outputs[mask, k - 1].detach().cpu().numpy().reshape(-1)
+                    yk = y[mask].detach().cpu().numpy()
+                    pk = expert_outputs[mask, k - 1].detach().cpu().numpy()
                     buf[k]["y"].append(yk)
                     buf[k]["p"].append(pk)
 
-            idx = (expert_ids - 1).view(-1, 1)
-            sel = expert_outputs.gather(1, idx).view(-1)
-            overall_y.append(y.detach().cpu().numpy().reshape(-1))
-            overall_p.append(sel.detach().cpu().numpy().reshape(-1))
+            idx = (expert_ids - 1).view(-1, 1, 1).expand(-1, 1, expert_outputs.size(-1))
+            sel = expert_outputs.gather(1, idx).squeeze(1)
+            overall_y.append(y.detach().cpu().numpy())
+            overall_p.append(sel.detach().cpu().numpy())
 
     rows = []
     for k in [1, 2, 3, 4]:
@@ -238,9 +271,9 @@ def _eval_pretrain_expert_metrics(model, val_loader, device):
         rows.append({
             "expert": str(k),
             "n": int(yt.shape[0]),
-            "mae": float(mean_absolute_error(yt, yp)),
-            "mse": float(mean_squared_error(yt, yp)),
-            "r2": float(r2_score(yt, yp)) if yt.shape[0] >= 2 else np.nan,
+            "mae": float(compute_metrics(yt, yp)['mae']),
+            "mse": float(compute_metrics(yt, yp)['mse']),
+            "r2": float(compute_metrics(yt, yp)['r2']),
         })
 
     if len(overall_y) == 0:
@@ -251,9 +284,9 @@ def _eval_pretrain_expert_metrics(model, val_loader, device):
         rows.append({
             "expert": "hard_routed_overall",
             "n": int(yt.shape[0]),
-            "mae": float(mean_absolute_error(yt, yp)),
-            "mse": float(mean_squared_error(yt, yp)),
-            "r2": float(r2_score(yt, yp)) if yt.shape[0] >= 2 else np.nan,
+            "mae": float(compute_metrics(yt, yp)['mae']),
+            "mse": float(compute_metrics(yt, yp)['mse']),
+            "r2": float(compute_metrics(yt, yp)['r2']),
         })
 
     return rows
@@ -376,9 +409,10 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                     raise RuntimeError("Model forward should return expert_outputs in pretrain stage.")
 
                 idx = expert_ids - 1
-                selected = expert_outputs.gather(1, idx.view(-1, 1))  # [B,1]
+                idx3 = idx.view(-1, 1, 1).expand(-1, 1, expert_outputs.size(-1))
+                selected = expert_outputs.gather(1, idx3).squeeze(1)  # (B,T)
 
-                loss, _ = criterion(selected, y, expert_id=expert_ids, gate_w=None, extra=None)
+                loss, data_loss, nonneg, smooth, entropy = criterion(selected, y, expert_id=expert_ids, gate_w=None)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(expert_params, 5.0)
                 optim_experts.step()
@@ -467,9 +501,9 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 raise RuntimeError("Unexpected model forward output format.")
 
             w_tau = _apply_temperature_to_weights(w_raw, tau)
-            preds = (w_tau * expert_outputs).sum(dim=1, keepdim=True)
+            preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
 
-            loss, loss_dict = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau, extra=None)
+            loss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(gate_params, 5.0)
             optim_gate.step()
@@ -477,10 +511,10 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
             _step_scheduler(sched_gate, sched_gate_interval, when="batch")
 
             running_train_loss += loss.item()
-            mse_epoch += loss_dict.get("MSE", 0.0)
-            nonneg_epoch += loss_dict.get("NonNeg", 0.0)
-            smooth_epoch += loss_dict.get("Smooth", 0.0)
-            entropy_epoch += loss_dict.get("Entropy", 0.0)
+            mse_epoch += float(data_loss.item())
+            nonneg_epoch += float(nonneg.item())
+            smooth_epoch += float(smooth.item())
+            entropy_epoch += float(entropy.item())
             n_batches += 1
 
             train_y_true.append(y.detach().cpu().numpy())
@@ -495,11 +529,12 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
         smooth_epoch /= max(n_batches, 1)
         entropy_epoch /= max(n_batches, 1)
 
-        train_y_true_np = np.concatenate(train_y_true, axis=0).reshape(-1)
-        train_y_pred_np = np.concatenate(train_y_pred, axis=0).reshape(-1)
-        train_mae = mean_absolute_error(train_y_true_np, train_y_pred_np)
-        train_mse_metric = mean_squared_error(train_y_true_np, train_y_pred_np)
-        train_r2 = r2_score(train_y_true_np, train_y_pred_np)
+        train_y_true_np = np.concatenate(train_y_true, axis=0)
+        train_y_pred_np = np.concatenate(train_y_pred, axis=0)
+        _m_tr = compute_metrics(train_y_true_np, train_y_pred_np)
+        train_mae = _m_tr['mae']
+        train_mse_metric = _m_tr['mse']
+        train_r2 = _m_tr['r2']
 
         # ----- validation -----
         model.eval()
@@ -532,9 +567,9 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                     raise RuntimeError("Unexpected model forward output format.")
 
                 w_tau = _apply_temperature_to_weights(w_raw, tau)
-                preds = (w_tau * expert_outputs).sum(dim=1, keepdim=True)
+                preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
 
-                vloss, _ = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau, extra=None)
+                vloss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
                 running_val_loss += vloss.item()
                 n_val_batches += 1
 
@@ -543,11 +578,12 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
 
         val_loss = running_val_loss / max(n_val_batches, 1)
 
-        val_y_true_np = np.concatenate(val_y_true, axis=0).reshape(-1)
-        val_y_pred_np = np.concatenate(val_y_pred, axis=0).reshape(-1)
-        val_mae = mean_absolute_error(val_y_true_np, val_y_pred_np)
-        val_mse_metric = mean_squared_error(val_y_true_np, val_y_pred_np)
-        val_r2 = r2_score(val_y_true_np, val_y_pred_np)
+        val_y_true_np = np.concatenate(val_y_true, axis=0)
+        val_y_pred_np = np.concatenate(val_y_pred, axis=0)
+        _m_va = compute_metrics(val_y_true_np, val_y_pred_np)
+        val_mae = _m_va['mae']
+        val_mse_metric = _m_va['mse']
+        val_r2 = _m_va['r2']
 
         _step_scheduler(sched_gate, sched_gate_interval, when="epoch_end", metric=val_loss)
 
@@ -715,9 +751,9 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                         raise RuntimeError("Unexpected model forward output format.")
 
                     w_tau = _apply_temperature_to_weights(w_raw, tau)
-                    preds = (w_tau * expert_outputs).sum(dim=1, keepdim=True)
+                    preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
 
-                    loss, loss_dict = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau, extra=None)
+                    loss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                     optim_joint.step()
@@ -725,10 +761,10 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                     _step_scheduler(sched_ft, sched_ft_interval, when="batch")
 
                     running_train_loss += loss.item()
-                    mse_epoch += loss_dict.get("MSE", 0.0)
-                    nonneg_epoch += loss_dict.get("NonNeg", 0.0)
-                    smooth_epoch += loss_dict.get("Smooth", 0.0)
-                    entropy_epoch += loss_dict.get("Entropy", 0.0)
+                    mse_epoch += float(data_loss.item())
+                    nonneg_epoch += float(nonneg.item())
+                    smooth_epoch += float(smooth.item())
+                    entropy_epoch += float(entropy.item())
                     n_batches += 1
 
                     train_y_true.append(y.detach().cpu().numpy())
@@ -743,11 +779,12 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 smooth_epoch /= max(n_batches, 1)
                 entropy_epoch /= max(n_batches, 1)
 
-                train_y_true_np = np.concatenate(train_y_true, axis=0).reshape(-1)
-                train_y_pred_np = np.concatenate(train_y_pred, axis=0).reshape(-1)
-                train_mae = mean_absolute_error(train_y_true_np, train_y_pred_np)
-                train_mse_metric = mean_squared_error(train_y_true_np, train_y_pred_np)
-                train_r2 = r2_score(train_y_true_np, train_y_pred_np)
+                train_y_true_np = np.concatenate(train_y_true, axis=0)
+                train_y_pred_np = np.concatenate(train_y_pred, axis=0)
+                _m_tr = compute_metrics(train_y_true_np, train_y_pred_np)
+                train_mae = _m_tr['mae']
+                train_mse_metric = _m_tr['mse']
+                train_r2 = _m_tr['r2']
 
                 model.eval()
                 running_val_loss = 0.0
@@ -779,9 +816,9 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                             raise RuntimeError("Unexpected model forward output format.")
 
                         w_tau = _apply_temperature_to_weights(w_raw, tau)
-                        preds = (w_tau * expert_outputs).sum(dim=1, keepdim=True)
+                        preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
 
-                        vloss, _ = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau, extra=None)
+                        vloss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
                         running_val_loss += vloss.item()
                         n_val_batches += 1
 
@@ -790,11 +827,12 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
 
                 val_loss = running_val_loss / max(n_val_batches, 1)
 
-                val_y_true_np = np.concatenate(val_y_true, axis=0).reshape(-1)
-                val_y_pred_np = np.concatenate(val_y_pred, axis=0).reshape(-1)
-                val_mae = mean_absolute_error(val_y_true_np, val_y_pred_np)
-                val_mse_metric = mean_squared_error(val_y_true_np, val_y_pred_np)
-                val_r2 = r2_score(val_y_true_np, val_y_pred_np)
+                val_y_true_np = np.concatenate(val_y_true, axis=0)
+                val_y_pred_np = np.concatenate(val_y_pred, axis=0)
+                _m_va = compute_metrics(val_y_true_np, val_y_pred_np)
+                val_mae = _m_va['mae']
+                val_mse_metric = _m_va['mse']
+                val_r2 = _m_va['r2']
 
                 _step_scheduler(sched_ft, sched_ft_interval, when="epoch_end", metric=val_loss)
 

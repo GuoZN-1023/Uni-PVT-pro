@@ -23,6 +23,8 @@ def apply_subset(df: pd.DataFrame, subset_cfg: dict | None,
     根据 config['subset'] 在 DataFrame 层面筛选数据：
       - include_expert_ids / exclude_expert_ids
       - fraction / max_samples
+
+    注意：subset 是“可选的训练加速/调试工具”，不影响列推断逻辑。
     """
     if not subset_cfg or not subset_cfg.get("enabled", False):
         return df
@@ -30,142 +32,238 @@ def apply_subset(df: pd.DataFrame, subset_cfg: dict | None,
     mask = pd.Series(True, index=df.index)
 
     # 按 no 等编号筛选
-    if expert_col is not None and expert_col in df.columns:
-        if "include_expert_ids" in subset_cfg and subset_cfg["include_expert_ids"]:
-            inc = subset_cfg["include_expert_ids"]
-            mask &= df[expert_col].isin(inc)
-        if "exclude_expert_ids" in subset_cfg and subset_cfg["exclude_expert_ids"]:
-            exc = subset_cfg["exclude_expert_ids"]
-            mask &= ~df[expert_col].isin(exc)
+    if expert_col and expert_col in df.columns:
+        inc = subset_cfg.get("include_expert_ids", None)
+        exc = subset_cfg.get("exclude_expert_ids", None)
+        if inc is not None:
+            inc = set(int(x) for x in inc)
+            mask &= df[expert_col].astype(int).isin(inc)
+        if exc is not None:
+            exc = set(int(x) for x in exc)
+            mask &= ~df[expert_col].astype(int).isin(exc)
 
-    # 按随机子样本抽样
-    df_sub = df[mask].copy()
+    df = df.loc[mask].copy()
 
+    # 随机抽样 fraction
     frac = subset_cfg.get("fraction", None)
-    max_samples = subset_cfg.get("max_samples", None)
-
     if frac is not None:
-        df_sub = df_sub.sample(frac=frac, random_state=42)
+        frac = float(frac)
+        frac = max(min(frac, 1.0), 0.0)
+        if 0.0 < frac < 1.0:
+            df = df.sample(frac=frac, random_state=42)
 
-    if max_samples is not None and len(df_sub) > max_samples:
-        df_sub = df_sub.sample(n=max_samples, random_state=42)
+    # 最多 max_samples
+    max_samples = subset_cfg.get("max_samples", None)
+    if max_samples is not None:
+        max_samples = int(max_samples)
+        if len(df) > max_samples:
+            df = df.sample(n=max_samples, random_state=42)
 
-    return df_sub.reset_index(drop=True)
+    return df
+
+
+def infer_feature_and_target_cols(
+    columns: list[str],
+    anchor_col: str = "Z (-)",
+    expert_col: str = "no",
+) -> tuple[list[str], list[str]]:
+    """
+    智能识别列（按用户定义的“相对位置规则”）：
+
+    - 自变量 X：在 anchor_col（默认 'Z (-)'）**之前** 的所有列（不含 anchor_col）
+    - 因变量候选 Y：从 anchor_col（含）到 expert_col（默认 'no'）之前的所有列
+      即 [anchor_col, ..., 直到 no 前一列]，不含 no
+
+    该规则严格依赖 CSV 的**列顺序**（不是字母排序）。
+    """
+    cols = list(columns)
+    if anchor_col not in cols:
+        raise ValueError(f"Anchor column '{anchor_col}' not found in CSV columns.")
+    if expert_col not in cols:
+        raise ValueError(f"Expert/region column '{expert_col}' not found in CSV columns.")
+
+    i_anchor = cols.index(anchor_col)
+    i_expert = cols.index(expert_col)
+
+    if i_expert <= i_anchor:
+        raise ValueError(
+            f"Column order invalid: '{expert_col}' must appear AFTER '{anchor_col}'. "
+            f"(got idx({expert_col})={i_expert}, idx({anchor_col})={i_anchor})"
+        )
+
+    feature_cols = cols[:i_anchor]
+    target_candidate_cols = cols[i_anchor:i_expert]  # includes anchor, excludes 'no'
+    if len(feature_cols) == 0:
+        raise ValueError("No feature columns inferred (nothing appears before anchor_col).")
+    if len(target_candidate_cols) == 0:
+        raise ValueError("No target columns inferred (nothing between anchor_col and expert_col).")
+
+    return feature_cols, target_candidate_cols
+
+
+def _normalize_targets_cfg(targets_cfg, all_targets: list[str]) -> list[str]:
+    """
+    targets_cfg 支持：
+      - None / "all" / "*" -> 全部因变量候选
+      - str -> 单个
+      - list[str] -> 多个
+    """
+    if targets_cfg is None:
+        return list(all_targets)
+
+    if isinstance(targets_cfg, str):
+        if targets_cfg.strip().lower() in ("all", "*"):
+            return list(all_targets)
+        return [targets_cfg]
+
+    if isinstance(targets_cfg, (list, tuple)):
+        # 保留在 all_targets 中出现的、同时保持用户给出的顺序
+        out = []
+        for t in targets_cfg:
+            if t in all_targets and t not in out:
+                out.append(t)
+        return out
+
+    raise ValueError(f"Unsupported targets config type: {type(targets_cfg)}")
 
 
 class ZDataset(Dataset):
     """
-    通用 Z 数据集：
-      - 从 csv_path 读取数据
-      - target_col 作为 y，其余数值列作为特征
-      - expert_col (如 'no') 作为编号，只用于专家预训练，不进入特征
-      - subset_cfg 控制子集抽样
-      - __getitem__ 返回 (X, y, expert_id)
+    自适应多任务数据集：
+
+    - 读取 CSV
+    - 按“位置规则”推断特征列 X 与因变量候选列 Y
+    - 通过 config 中的 targets/target_cols/target_col 选择要预测的目标列（可 1 个或多个）
+    - no 列必须存在：作为相区编号 expert_id，仅用于 Stage1 专家预训练/区域加权，不进入特征
+
+    __getitem__ 返回 (X, y, expert_id)
+      - X: FloatTensor, shape (D,)
+      - y: FloatTensor, shape (T,)  (T=目标数)
+      - expert_id: LongTensor, shape ()
     """
     def __init__(
         self,
         csv_path: str,
         scaler_path: str,
+        cfg: dict,
         train: bool = True,
-        target_col: str = "Z (-)",
-        expert_col: str | None = "no",
-        subset_cfg: dict | None = None,
     ):
         super().__init__()
 
         if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"Data file not found: {csv_path}")
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
 
-        df = pd.read_csv(csv_path)
+        self.cfg = cfg
+        self.csv_path = csv_path
+        self.scaler_path = scaler_path
+        self.train = bool(train)
 
-        if target_col not in df.columns:
+        # 兼容旧配置：target_col 单列
+        anchor_col = cfg.get("anchor_col", cfg.get("target_anchor_col", cfg.get("target_col", "Z (-)")))
+        expert_col = cfg.get("expert_col", "no")
+
+        df_raw = pd.read_csv(csv_path)
+
+        # 按列顺序推断 X / Y 候选
+        feature_cols_raw, target_candidates_raw = infer_feature_and_target_cols(
+            list(df_raw.columns), anchor_col=anchor_col, expert_col=expert_col
+        )
+
+        # 选择要预测的 targets（可多目标）
+        targets_cfg = (
+            cfg.get("targets", None)
+            if "targets" in cfg
+            else cfg.get("target_cols", None)
+        )
+        if targets_cfg is None and "target_col" in cfg and isinstance(cfg.get("target_col"), str):
+            targets_cfg = cfg.get("target_col")
+        chosen_targets = _normalize_targets_cfg(targets_cfg, target_candidates_raw)
+        if len(chosen_targets) == 0:
             raise ValueError(
-                f"target_col='{target_col}' not in columns: {list(df.columns)}"
+                "No valid targets selected. "
+                f"Candidates (between {anchor_col} and {expert_col}): {target_candidates_raw}. "
+                f"Your config targets: {targets_cfg}"
             )
 
-        # 先按 subset 规则筛数据
-        df = apply_subset(df, subset_cfg, expert_col)
+        # 数值化：只保留需要的列（X + chosen_targets + expert_col）
+        needed_cols = list(feature_cols_raw) + list(chosen_targets) + [expert_col]
+        df = df_raw.loc[:, needed_cols].copy()
 
-        # 只保留数值列（防止字符串），并重置索引以和 Dataset 下标对齐
-        num_df = df.select_dtypes(include=[np.number]).reset_index(drop=True)
-        # 保存一份数值 DataFrame，便于预测阶段回写原始状态变量
-        self.num_df = num_df
+        # 强制转换为数值（把字符串等转成 NaN），再统一 dropna
+        for c in needed_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        if target_col not in num_df.columns:
-            raise ValueError(f"target_col '{target_col}' must be numeric")
+        before = len(df)
+        df = df.dropna(axis=0, how="any").reset_index(drop=True)
+        dropped = before - len(df)
+        if dropped > 0:
+            # 保持安静，但给出最基本的提示
+            print(f"[ZDataset] Dropped {dropped} rows due to NaNs after numeric conversion.")
 
-        # 目标值 y
-        self.y = torch.tensor(
-            num_df[target_col].values, dtype=torch.float32
-        ).view(-1, 1)
+        # subset（可选）
+        subset_cfg = cfg.get("subset", None)
+        df = apply_subset(df, subset_cfg=subset_cfg, expert_col=expert_col).reset_index(drop=True)
 
-        # 专家编号（如 1/2/3/4），仅供预训练硬分区使用
+        # expert id
+        if expert_col not in df.columns:
+            raise ValueError(f"Required expert_col '{expert_col}' missing after preprocessing.")
+        self.expert_ids = df[expert_col].astype(int).values
+
+        # 保存列信息（用于 train/predict 输出）
+        self.anchor_col = anchor_col
         self.expert_col = expert_col
-        if expert_col is not None and expert_col in num_df.columns:
-            self.expert_ids = num_df[expert_col].astype(int).values
-        else:
-            self.expert_ids = np.full(len(num_df), -1, dtype=int)
+        self.feature_cols = list(feature_cols_raw)
+        self.all_target_cols = list(target_candidates_raw)
+        self.target_cols = list(chosen_targets)
 
-        # 特征列：去掉 target 和 expert_col
-        drop_cols = [target_col]
-        if expert_col is not None and expert_col in num_df.columns:
-            drop_cols.append(expert_col)
-        feature_cols = [c for c in num_df.columns if c not in drop_cols]
-        if len(feature_cols) == 0:
-            raise ValueError("No feature columns left after dropping target and expert_col.")
+        # X / y
+        X = df[self.feature_cols].values.astype(np.float32)
+        y = df[self.target_cols].values.astype(np.float32)  # (N,T)
 
-        self.feature_cols = feature_cols
-        X_raw = num_df[feature_cols].values.astype(np.float32)
-
-        # 标准化
-        if train:
+        # scaler
+        if self.train:
             scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_raw)
-            os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
-            joblib.dump(scaler, scaler_path)
+            Xs = scaler.fit_transform(X)
+            os.makedirs(os.path.dirname(self.scaler_path), exist_ok=True)
+            joblib.dump(scaler, self.scaler_path)
         else:
-            if not os.path.exists(scaler_path):
-                raise FileNotFoundError(
-                    f"Scaler not found at {scaler_path}. Run training once to create the scaler."
-                )
-            scaler = joblib.load(scaler_path)
-            X_scaled = scaler.transform(X_raw)
+            if not os.path.exists(self.scaler_path):
+                raise FileNotFoundError(f"Scaler not found: {self.scaler_path} (run train first?)")
+            scaler = joblib.load(self.scaler_path)
+            Xs = scaler.transform(X)
 
-        self.X = torch.tensor(X_scaled, dtype=torch.float32)
-
-    @property
-    def input_dim(self) -> int:
-        return self.X.shape[1]
+        self.X = Xs.astype(np.float32)
+        self.y = y
+        self.input_dim = int(self.X.shape[1])
+        self.output_dim = int(self.y.shape[1])
 
     def __len__(self):
-        return self.X.shape[0]
+        return len(self.X)
 
     def __getitem__(self, idx):
-        x = self.X[idx]
-        y = self.y[idx]
-        expert_id = int(self.expert_ids[idx])
+        x = torch.tensor(self.X[idx], dtype=torch.float32)
+        y = torch.tensor(self.y[idx], dtype=torch.float32)
+        expert_id = torch.tensor(self.expert_ids[idx], dtype=torch.long)
         return x, y, expert_id
 
 
 def get_dataloaders(cfg: dict):
     """
     根据 config 构建 train/val/test DataLoader
+
+    重要：input_dim/output_dim 由数据自动推断，
+    train.py 会在拿到 dataloaders 后把它写回 cfg['model']。
     """
     data_path = cfg["paths"]["data"]
     scaler_path = cfg["paths"]["scaler"]
-    target_col = cfg.get("target_col", "Z (-)")
-    expert_col = cfg.get("expert_col", "no")
-    subset_cfg = cfg.get("subset", None)
 
     set_seed(42)
 
     full_dataset = ZDataset(
         csv_path=data_path,
         scaler_path=scaler_path,
+        cfg=cfg,
         train=True,
-        target_col=target_col,
-        expert_col=expert_col,
-        subset_cfg=subset_cfg,
     )
 
     n_total = len(full_dataset)
@@ -178,7 +276,7 @@ def get_dataloaders(cfg: dict):
         full_dataset, [n_train, n_val, n_test], generator=g
     )
 
-    bs = cfg["training"]["batch_size"]
+    bs = int(cfg["training"]["batch_size"])
     return {
         "train": DataLoader(train_set, batch_size=bs, shuffle=True),
         "val": DataLoader(val_set, batch_size=bs, shuffle=False),

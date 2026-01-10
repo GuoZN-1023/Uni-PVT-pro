@@ -8,11 +8,10 @@ class PhysicsLoss(nn.Module):
     """
     Loss = region-weighted(data loss) + lambda_nonneg*nonneg + lambda_smooth*smooth + lambda_entropy*entropy(optional)
 
-    - data loss supports: mse / huber
-    - region-weighted: expert_id (1..4) -> weight
-    - entropy regularization: encourage sharper gate weights (optional)
+    支持多目标回归：
+      pred: (B,T)  target: (B,T)
+      data loss 会先对 target 维度做 mean，得到每个样本一个标量 loss，再做区域加权
     """
-
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
@@ -32,18 +31,26 @@ class PhysicsLoss(nn.Module):
         else:
             self.region_weights = None
 
-    def _data_loss_vec(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Return per-sample loss vector shape (B,)"""
-        pred = pred.view(-1)
-        target = target.view(-1)
+    def _data_loss_per_sample(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        返回每个样本一个标量 loss，shape (B,)
+
+        pred/target: (B,T) or (B,1) or (B,)
+        """
+        if pred.dim() == 1:
+            pred = pred.unsqueeze(1)
+        if target.dim() == 1:
+            target = target.unsqueeze(1)
 
         if self.loss_type == "huber":
-            # smooth_l1_loss gives per-element if reduction='none'
-            return F.smooth_l1_loss(pred, target, beta=self.huber_delta, reduction="none")
-        # default mse
-        return (pred - target) ** 2
+            # per-element
+            el = F.smooth_l1_loss(pred, target, beta=self.huber_delta, reduction="none")  # (B,T)
+        else:
+            el = (pred - target) ** 2  # (B,T)
 
-    def _region_weight_vec(self, expert_id: torch.Tensor, device) -> torch.Tensor:
+        return el.mean(dim=1)  # (B,)
+
+    def _region_weight_vec(self, expert_id: torch.Tensor, device) -> torch.Tensor | None:
         """expert_id shape (B,), values 1..4"""
         if self.region_weights is None or expert_id is None:
             return None
@@ -53,60 +60,40 @@ class PhysicsLoss(nn.Module):
             w = torch.where(eid == int(k), torch.tensor(float(v), device=device), w)
         return w
 
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        expert_id: torch.Tensor = None,
-        gate_w: torch.Tensor = None,
-        extra: dict = None,
-    ):
-        """
-        pred: (B,) or (B,1)
-        target: (B,) or (B,1)
-        expert_id: (B,) optional
-        gate_w: (B,4) optional, for entropy reg
-        extra: optional dict for smooth etc.
-        """
-        pred = pred.view(-1)
-        target = target.view(-1)
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                gate_w: torch.Tensor | None = None,
+                expert_id: torch.Tensor | None = None):
+        device = pred.device
 
-        # -------- data loss (region weighted) --------
-        loss_vec = self._data_loss_vec(pred, target)  # (B,)
-        w_reg = self._region_weight_vec(expert_id, pred.device)
-        if w_reg is not None:
-            loss_data = (w_reg * loss_vec).mean()
+        # -------- data loss --------
+        loss_vec = self._data_loss_per_sample(pred, target)  # (B,)
+        region_w = self._region_weight_vec(expert_id, device)
+        if region_w is not None:
+            data_loss = torch.mean(loss_vec * region_w)
         else:
-            loss_data = loss_vec.mean()
+            data_loss = torch.mean(loss_vec)
 
-        # -------- nonneg penalty --------
-        loss_nonneg = torch.tensor(0.0, device=pred.device)
-        if self.lambda_nonneg > 0:
-            loss_nonneg = F.relu(-pred).mean()
+        # -------- nonneg penalty (encourage pred >= 0) --------
+        nonneg = torch.tensor(0.0, device=device)
+        if self.lambda_nonneg != 0.0:
+            nonneg = torch.mean(F.relu(-pred))
 
-        # -------- smooth penalty (keep your original convention; uses batch adjacency) --------
-        loss_smooth = torch.tensor(0.0, device=pred.device)
-        if self.lambda_smooth > 0:
-            if extra is not None and isinstance(extra, dict) and "pred_sorted" in extra:
-                ps = extra["pred_sorted"].view(-1)
+        # -------- smooth penalty (batch-adjacent smoothness) --------
+        smooth = torch.tensor(0.0, device=device)
+        if self.lambda_smooth != 0.0:
+            if pred.dim() == 1:
+                dp = pred[1:] - pred[:-1]
+                smooth = torch.mean(dp ** 2)
             else:
-                ps = pred
-            if ps.numel() >= 2:
-                loss_smooth = ((ps[1:] - ps[:-1]) ** 2).mean()
+                dp = pred[1:, :] - pred[:-1, :]
+                smooth = torch.mean(dp ** 2)
 
-        # -------- entropy penalty (sharpen gate) --------
-        # We add: lambda_entropy * mean( sum_i w_i * log(w_i) )   (negative entropy; makes distribution sharper)
-        loss_entropy = torch.tensor(0.0, device=pred.device)
-        if self.lambda_entropy > 0 and gate_w is not None:
+        # -------- entropy regularization on gate weights --------
+        entropy = torch.tensor(0.0, device=device)
+        if self.lambda_entropy != 0.0 and gate_w is not None:
             w = torch.clamp(gate_w, 1e-12, 1.0)
-            loss_entropy = (w * torch.log(w)).sum(dim=1).mean()
+            ent = -torch.sum(w * torch.log(w), dim=1)  # (B,)
+            entropy = torch.mean(ent)
 
-        total = loss_data + self.lambda_nonneg * loss_nonneg + self.lambda_smooth * loss_smooth + self.lambda_entropy * loss_entropy
-
-        loss_dict = {
-            "MSE": float(loss_data.detach().cpu().item()),
-            "NonNeg": float(loss_nonneg.detach().cpu().item()),
-            "Smooth": float(loss_smooth.detach().cpu().item()),
-            "Entropy": float(loss_entropy.detach().cpu().item()),
-        }
-        return total, loss_dict
+        total = data_loss + self.lambda_nonneg * nonneg + self.lambda_smooth * smooth + self.lambda_entropy * entropy
+        return total, data_loss.detach(), nonneg.detach(), smooth.detach(), entropy.detach()

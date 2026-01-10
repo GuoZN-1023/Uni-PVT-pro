@@ -11,6 +11,13 @@ from utils.trainer import train_model
 from utils.logger import get_file_logger
 
 
+
+def _unwrap_dataset(ds):
+    """Handle torch.utils.data.Subset nesting."""
+    while hasattr(ds, "dataset"):
+        ds = ds.dataset
+    return ds
+
 def _bridge_loss_cfg_to_training(cfg: dict):
 
     cfg.setdefault("training", {})
@@ -41,7 +48,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="config/config.yaml",
+        default="config/current.yaml",
         help="配置文件路径",
     )
     parser.add_argument(
@@ -81,6 +88,18 @@ def main():
     logger.info(f"Device: {device}")
 
     dataloaders = get_dataloaders(cfg)
+
+    # ---- infer input/output dims + selected targets from data ----
+    base_ds = _unwrap_dataset(dataloaders["train"].dataset)
+    cfg.setdefault("model", {})
+    cfg["model"]["input_dim"] = int(getattr(base_ds, "input_dim"))
+    cfg["model"]["output_dim"] = int(getattr(base_ds, "output_dim", 1))
+    cfg["resolved"] = {
+        "feature_cols": list(getattr(base_ds, "feature_cols", [])),
+        "target_cols": list(getattr(base_ds, "target_cols", [])),
+        "expert_col": str(getattr(base_ds, "expert_col", cfg.get("expert_col", "no"))),
+        "anchor_col": str(getattr(base_ds, "anchor_col", cfg.get("anchor_col", "Z (-)"))),
+    }
 
     train_loader = dataloaders["train"]
     if hasattr(train_loader.dataset, "dataset"):

@@ -1,8 +1,0 @@
-2026-01-10 20:48:51,193 - INFO - Device: cpu
-2026-01-10 20:48:51,194 - INFO - Config: /Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/results/2026-01-10_20-42-44/config_used.yaml
-2026-01-10 20:48:51,194 - INFO - Save dir: results/2026-01-10_20-42-44/shap
-2026-01-10 20:49:08,541 - ERROR - Failed to import matplotlib. Please `pip install matplotlib`.
-Traceback (most recent call last):
-  File "/Users/guozhenning/Desktop/VSCodeProjects/Uni-PVT-pro/shap_analysis.py", line 99, in main
-    import matplotlib
-ModuleNotFoundError: No module named 'matplotlib'

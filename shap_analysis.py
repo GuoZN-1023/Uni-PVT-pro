@@ -44,28 +44,37 @@ def subset_to_xy(subset, max_samples=None, device="cpu"):
     return X, y
 
 
-def _as_array(shap_values):
-
-    if isinstance(shap_values, list):
-        arr = np.array(shap_values[0])
-    else:
-        arr = np.array(shap_values)
-    return arr
-
 
 def _ensure_2d_shap(arr: np.ndarray):
-
+    arr = np.array(arr)
     if arr.ndim == 3 and arr.shape[-1] == 1:
         arr = arr[..., 0]
-    if arr.ndim == 3 and arr.shape[0] == 1:
-        arr = arr[0, ...]
-    if arr.ndim == 3 and arr.shape[1] == 1:
-        arr = arr[:, 0, :]
     if arr.ndim != 2:
-        raise ValueError(f"SHAP values must be 2D after squeeze. Got shape={arr.shape}")
+        raise ValueError(f"SHAP values must be 2D, got shape={arr.shape}")
     return arr
 
 
+def _split_shap_values(vals, n_outputs: int):
+    """Normalize SHAP output to list[(N,D)] of length n_outputs."""
+    if isinstance(vals, list):
+        out = [np.array(v) for v in vals]
+        if len(out) == 1 and n_outputs > 1:
+            arr = np.array(out[0])
+            if arr.ndim == 3 and arr.shape[-1] == n_outputs:
+                out = [arr[:, :, j] for j in range(n_outputs)]
+        return [_ensure_2d_shap(v) for v in out]
+
+    arr = np.array(vals)
+    if arr.ndim == 2:
+        return [_ensure_2d_shap(arr)]
+    if arr.ndim == 3:
+        if arr.shape[-1] == n_outputs:
+            return [_ensure_2d_shap(arr[:, :, j]) for j in range(n_outputs)]
+        if arr.shape[0] == n_outputs:
+            return [_ensure_2d_shap(arr[j, :, :]) for j in range(n_outputs)]
+        if arr.shape[-1] == 1:
+            return [_ensure_2d_shap(arr[:, :, 0])]
+    raise ValueError(f"Unsupported SHAP values shape: {arr.shape}")
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
@@ -112,10 +121,8 @@ def main():
     dataset = ZDataset(
         csv_path=data_path,
         scaler_path=scaler_path,
+        cfg=cfg,
         train=False,
-        target_col=target_col,
-        expert_col=expert_col,
-        subset_cfg=subset_cfg,
     )
 
 
@@ -152,23 +159,24 @@ def main():
     X_bg, _ = subset_to_xy(train_set, max_samples=background_size, device=device)
     X_explain, y_explain = subset_to_xy(test_set, max_samples=explain_size, device=device)
 
-    shap_values_arr = None
+    shap_values_raw = None
+    shap_values_list = None
     used = None
 
     def run_deep():
-        nonlocal shap_values_arr, used
+        nonlocal shap_values_raw, used
         logger.info("Trying DeepExplainer(check_additivity=False) ...")
         explainer = shap.DeepExplainer(wrapper, X_bg)
         vals = explainer.shap_values(X_explain, check_additivity=False)
-        shap_values_arr = _ensure_2d_shap(_as_array(vals))
+        shap_values_raw = vals
         used = "DeepExplainer(check_additivity=False)"
 
     def run_grad():
-        nonlocal shap_values_arr, used
+        nonlocal shap_values_raw, used
         logger.info("Trying GradientExplainer ...")
         explainer = shap.GradientExplainer(wrapper, X_bg)
         vals = explainer.shap_values(X_explain)
-        shap_values_arr = _ensure_2d_shap(_as_array(vals))
+        shap_values_raw = vals
         used = "GradientExplainer"
 
     if args.method == "deep":
@@ -191,10 +199,23 @@ def main():
     with torch.no_grad():
         y_pred_np = wrapper(X_explain).detach().cpu().numpy().reshape(-1)
 
-    logger.info(f"Explainer used: {used}, shap shape={shap_values_arr.shape}")
+    target_cols = list(getattr(dataset, "target_cols", []))
+    if len(target_cols) == 0:
+        target_cols = [cfg.get("target_col", "Z (-)")]
+    n_outputs = len(target_cols)
+    shap_values_list = _split_shap_values(shap_values_raw, n_outputs)
+    logger.info(f"Explainer used: {used}, n_outputs={n_outputs}, shap shapes={[v.shape for v in shap_values_list]}")
 
 
-    logger.info("Saving shap_summary.png ...")
+
+# ---- SHAP summary plots: one per target ----
+for j, tgt in enumerate(target_cols):
+    if j >= len(shap_values_list):
+        break
+    shap_values_arr = shap_values_list[j]
+    safe = "".join(ch if ch.isalnum() else "_" for ch in str(tgt))[:80]
+
+    logger.info(f"Saving shap_summary__{safe}.png ...")
     plt.figure(figsize=(9, 6))
     shap.summary_plot(
         shap_values_arr,
@@ -203,9 +224,16 @@ def main():
         show=False,
     )
     plt.tight_layout()
-    summary_png = os.path.join(shap_dir, "shap_summary.png")
+    summary_png = os.path.join(shap_dir, f"shap_summary__{safe}.png")
     plt.savefig(summary_png, dpi=300)
     plt.close()
+
+    # mean(|shap|) bar CSV per target
+    mean_abs = np.mean(np.abs(shap_values_arr), axis=0)
+    df_bar = pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs}).sort_values("mean_abs_shap", ascending=False)
+    bar_csv = os.path.join(shap_dir, f"shap_bar__{safe}.csv")
+    df_bar.to_csv(bar_csv, index=False)
+
 
 
     logger.info("Saving shap_values.csv ...")
