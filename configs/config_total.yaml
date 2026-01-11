@@ -1,0 +1,174 @@
+# =========================
+# Uni-PVT Training Config
+# Multi-target + PINN Thermo Constraints
+# Targets: Z, phi, H, S
+# =========================
+
+# ---- Data & I/O ----
+paths:
+  data: data/Water.csv
+  save_dir: results/latest
+  scaler: results/latest/scaler.pkl
+
+# 相区编号列（必须存在）
+expert_col: "no"
+
+# 模型的输入列名（顺序就是输入顺序）
+# 建议至少包含压力 P 和温度 T（PINN 要用）
+feature_cols:
+  - "T_r (-)"
+  - "p_r (-)"
+  - "omega (-)"
+  - "p_c (Pa)"
+  - "T_c (K)"
+
+# 你要预测的输出列名（一次训练多个）
+targets:
+  - "Z (-)"
+  - "phi (-)"
+  - "H (J/mol)"
+  - "S (J/mol/K)"
+
+# ---- Model: Mixture-of-Experts ----
+experts:
+  gas:
+    hidden_layers: [512, 256, 128, 64]
+    activation: gelu
+    dropout: 0.0
+  liquid:
+    hidden_layers: [512, 256, 128, 64]
+    activation: gelu
+    dropout: 0.0
+  critical:
+    hidden_layers: [512, 256, 128, 64]
+    activation: tanh
+    dropout: 0.0
+  extra:
+    hidden_layers: [512, 256, 128]
+    activation: gelu
+    dropout: 0.0
+
+gate:
+  hidden_layers: [512, 256, 128, 64]
+  activation: relu
+  dropout: 0.05
+
+model:
+  # input_dim / output_dim 会由 feature_cols 与 targets 自动推断
+  # 这里填什么都无所谓，但保留字段方便你读 config
+  input_dim: 8
+  output_dim: 4
+
+# ---- Training Strategy (3-stage) ----
+training:
+  seed: 42
+  batch_size: 256
+
+  # Optimizer base LR（各阶段共享起点，内部可按阶段衰减或独立设置）
+  learning_rate: 0.0017
+  weight_decay: 0.0
+
+  # Stage-1: 只预训练专家（hard routing by no）
+  pretrain_epochs: 100
+
+  # Stage-2: 冻结专家，只训练 gate（用于稳定融合与相区边界）
+  gate_epochs: 200
+
+  # Stage-3: 联合微调（默认：gate + 全部专家或部分专家）
+  finetune:
+    enabled: true
+    epochs: 80
+    unfreeze: ["gas", "liquid", "critical", "extra"]  # 或只解冻部分
+    learning_rate: 0.0007                            # 微调可更小
+
+  # Early stopping（主要作用于 Stage-2/Stage-3）
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
+
+  # Gate temperature（可选：让权重从更软到更硬）
+  gate_temperature_schedule:
+    enabled: true
+    start: 1.5
+    end: 0.8
+
+# ---- Loss: Supervised + Regularizers ----
+loss:
+  # 监督损失类型：mse / huber
+  supervised: "mse"
+
+  # 多目标是否做目标尺度平衡（建议开：不同物性量纲差别大）
+  target_normalize:
+    enabled: true
+    mode: "per_target_std"   # 用训练集每个 target 的 std 归一化 loss
+
+  # 区域权重（按 no 相区编号加权，可不启用）
+  region_weights:
+    enabled: false
+    weights: {}              # 例如 {1: 1.0, 2: 1.0, 3: 2.0, 4: 1.2}
+
+  # 物理与数值正则项（保持你原有项）
+  lambda_nonneg: 3.08e-05
+  lambda_smooth: 0.0
+
+  # Z≈1 等“极端区域”的额外权重（你原本的设计）
+  lambda_extreme: 1.0
+  extreme_alpha: 4.0
+
+  # 相对误差项（你原本关掉，我也保持关）
+  lambda_relative: 0.0
+
+  # 门控熵正则（负值趋向更平均分配，正值趋向更尖锐）
+  lambda_entropy: -0.01
+
+# ---- PINN Thermodynamics Constraints ----
+pinn:
+  input_mode: reduced
+  enabled: true
+
+  # 目标列名映射（必须与 targets 一致）
+  z_name: "Z (-)"
+  phi_name: "phi (-)"
+  h_name: "H (J/mol)"
+  s_name: "S (J/mol/K)"
+
+  # 从 feature_cols 中挑出 P 与 T 的列名（必须存在）
+  p_feature: "P (MPa)"
+  t_feature: "T (K)"
+
+  # 单位换算：把 p_feature 的数值转成 Pa
+  # 若 P 用 MPa -> 1e6；kPa -> 1e3；Pa -> 1
+  p_to_Pa: 1.0e6
+
+  # 气体常数
+  R: 8.31446261815324
+
+  # PINN 残差权重（建议先小后大，先训稳监督）
+  lambda_phi: 0.05
+  lambda_H: 0.05
+  lambda_S: 0.05
+
+  # 何时启用 PINN（不改你的逻辑：先让专家学拟合，再加物理约束）
+  schedule:
+    apply_in_pretrain: false
+    apply_in_gate_train: true
+    apply_in_finetune: true
+
+# ---- SHAP Explainability ----
+shap:
+  enabled: true
+  # 多目标会按 target 分别输出 SHAP 结果
+  max_samples: 2000
+
+# ---- Optuna (Multi-objective) ----
+optuna:
+  enabled: false
+  n_trials: 50
+  sampler: "tpe"
+  directions: ["minimize", "minimize", "minimize"]   # [1-R2, MAE, MSE] 之类
+  study_name: "uni_pvt_mo"
+  storage: null   # 例如 "sqlite:///optuna.db"
+
+  # 可选：搜索空间（你若要启用再填）
+  search_space: {}

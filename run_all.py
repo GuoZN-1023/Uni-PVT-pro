@@ -42,7 +42,24 @@ def run_cmd(cmd, stdout_path: str, stderr_path: str, runall_log: str, cwd=None, 
     _append(runall_log, f"[run_all] Return code: {result.returncode}")
 
     if result.returncode != 0 and not allow_fail:
-        raise RuntimeError(f"Command failed with code {result.returncode}: {' '.join(cmd)}")
+        # Surface the last part of stderr to make debugging easier.
+        tail = ""
+        try:
+            with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail_lines = lines[-120:]  # last ~120 lines
+            tail = "".join(tail_lines)
+        except Exception:
+            tail = "(failed to read stderr log tail)"
+
+        _append(runall_log, "[run_all] ---- stderr tail (last 120 lines) ----")
+        _append(runall_log, tail)
+        _append(runall_log, "[run_all] ---- end stderr tail ----")
+
+        raise RuntimeError(
+            f"Command failed with code {result.returncode}: {' '.join(cmd)}\n"
+            f"See full logs:\n  stdout: {stdout_path}\n  stderr: {stderr_path}"
+        )
     return result.returncode
 
 

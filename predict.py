@@ -9,6 +9,29 @@ from torch.utils.data import random_split, DataLoader
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import plotly.express as px
 
+
+
+def _model_forward(model, x):
+    """
+    Supports both legacy tuple output and the new dict output.
+    Returns: fused (B,T), gate_w (dict or tensor), expert_outputs_all (B,4,T)
+    """
+    out = model(x)
+    if isinstance(out, tuple) or isinstance(out, list):
+        fused, w, expert_outputs = out
+        return fused, w, expert_outputs
+    fused = out["fused"]
+    gate_w = out.get("gate_w", None)
+    exps = out.get("expert_outputs", {})
+    expert_all = exps.get("all", None)
+    if expert_all is None:
+        # non-cascade dict but no 'all'? fall back to any available
+        if "z" in exps and "props" in exps:
+            # assemble best-effort
+            expert_all = None
+        else:
+            expert_all = next(iter(exps.values()))
+    return fused, gate_w, expert_all
 from models.fusion_model import FusionModel
 from utils.dataset import ZDataset
 from utils.logger import get_file_logger
@@ -133,20 +156,46 @@ def main():
     model.eval()
 
     y_true_list, fused_list, w_list, experts_list = [], [], [], []
+    w_z_list, w_props_list = [], []
 
     with torch.no_grad():
         for x, y, _eid in test_loader:
             x = x.to(device)
             y = y.to(device)
-            fused, w, expert_outputs = model(x)
+            fused, w, expert_outputs = _model_forward(model, x)
             y_true_list.append(y.detach().cpu().numpy())
             fused_list.append(fused.detach().cpu().numpy())
-            w_list.append(w.detach().cpu().numpy())
+            if isinstance(w, dict):
+                wz = w.get("z", None)
+                wp = w.get("props", None)
+                wa = w.get("all", None)
+                if wa is None and (wz is not None) and (wp is not None):
+                    wa = 0.5 * (wz + wp)
+                elif wa is None and (wz is not None):
+                    wa = wz
+                elif wa is None and (wp is not None):
+                    wa = wp
+
+                if wz is not None:
+                    w_z_list.append(wz.detach().cpu().numpy())
+                if wp is not None:
+                    w_props_list.append(wp.detach().cpu().numpy())
+                if wa is None:
+                    # last-resort: take the first available tensor in dict
+                    for _, vv in w.items():
+                        if vv is not None:
+                            wa = vv
+                            break
+                w_list.append(wa.detach().cpu().numpy())
+            else:
+                w_list.append(w.detach().cpu().numpy())
             experts_list.append(expert_outputs.detach().cpu().numpy())
 
     y_true = np.concatenate(y_true_list, axis=0)              # (N,T)
     y_fused = np.concatenate(fused_list, axis=0)              # (N,T)
     gate_w = np.concatenate(w_list, axis=0)                   # (N,4)
+    gate_w_z = np.concatenate(w_z_list, axis=0) if len(w_z_list) else None
+    gate_w_props = np.concatenate(w_props_list, axis=0) if len(w_props_list) else None
     y_experts = np.concatenate(experts_list, axis=0)          # (N,4,T)
 
     # ---- fused metrics (overall) ----
@@ -205,6 +254,17 @@ def main():
     df_pred["gate_w_liquid"] = gate_w[:, 1]
     df_pred["gate_w_critical"] = gate_w[:, 2]
     df_pred["gate_w_extra"] = gate_w[:, 3]
+
+    if gate_w_z is not None:
+        df_pred["gate_w_Z_gas"] = gate_w_z[:, 0]
+        df_pred["gate_w_Z_liquid"] = gate_w_z[:, 1]
+        df_pred["gate_w_Z_critical"] = gate_w_z[:, 2]
+        df_pred["gate_w_Z_extra"] = gate_w_z[:, 3]
+    if gate_w_props is not None:
+        df_pred["gate_w_props_gas"] = gate_w_props[:, 0]
+        df_pred["gate_w_props_liquid"] = gate_w_props[:, 1]
+        df_pred["gate_w_props_critical"] = gate_w_props[:, 2]
+        df_pred["gate_w_props_extra"] = gate_w_props[:, 3]
 
     # per-target columns
     for j, tgt in enumerate(target_cols):

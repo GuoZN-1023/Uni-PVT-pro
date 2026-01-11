@@ -11,7 +11,6 @@ from utils.trainer import train_model
 from utils.logger import get_file_logger
 
 
-
 def _unwrap_dataset(ds):
     """Handle torch.utils.data.Subset nesting."""
     while hasattr(ds, "dataset"):
@@ -99,6 +98,14 @@ def main():
         "target_cols": list(getattr(base_ds, "target_cols", [])),
         "expert_col": str(getattr(base_ds, "expert_col", cfg.get("expert_col", "no"))),
         "anchor_col": str(getattr(base_ds, "anchor_col", cfg.get("anchor_col", "Z (-)"))),
+    }
+    # Backward/forward compatible metadata for model mapping.
+    # PINN cascade mapping needs target order; some modules read `data_meta`, older code used `resolved`.
+    cfg["data_meta"] = {
+        "feature_cols": list(cfg["resolved"]["feature_cols"]),
+        "target_cols": list(cfg["resolved"]["target_cols"]),
+        "expert_col": cfg["resolved"]["expert_col"],
+        "anchor_col": cfg["resolved"]["anchor_col"],
     }
 
     train_loader = dataloaders["train"]

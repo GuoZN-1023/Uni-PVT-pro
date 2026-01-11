@@ -1,11 +1,15 @@
+
 # utils/trainer.py
+from __future__ import annotations
 import os
-import inspect
+import math
 import torch
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from .thermo_pinn import ThermoPinnLoss
+
 
 def _as_2d(a: np.ndarray) -> np.ndarray:
     a = np.asarray(a)
@@ -14,47 +18,74 @@ def _as_2d(a: np.ndarray) -> np.ndarray:
     return a
 
 
-def compute_metrics(y_true, y_pred):
-    """Return dict with per_target and mean metrics for multi-output regression."""
-    yt = _as_2d(np.asarray(y_true))
-    yp = _as_2d(np.asarray(y_pred))
+def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, target_cols: list[str] | None = None) -> dict:
+    yt = _as_2d(y_true)
+    yp = _as_2d(y_pred)
+    T = yt.shape[1]
+    names = target_cols if (target_cols and len(target_cols) == T) else [f"t{i}" for i in range(T)]
 
-    # sklearn supports multioutput
-    mae_vec = mean_absolute_error(yt, yp, multioutput="raw_values")
-    mse_vec = mean_squared_error(yt, yp, multioutput="raw_values")
-    if yt.shape[0] >= 2:
-        r2_vec = r2_score(yt, yp, multioutput="raw_values")
-    else:
-        r2_vec = np.full((yt.shape[1],), np.nan, dtype=float)
+    rows = []
+    for j, name in enumerate(names):
+        ytj = yt[:, j]
+        ypj = yp[:, j]
+        rows.append({
+            "target": name,
+            "MAE": float(mean_absolute_error(ytj, ypj)),
+            "MSE": float(mean_squared_error(ytj, ypj)),
+            "R2": float(r2_score(ytj, ypj)),
+        })
 
-    out = {
-        "mae_per_target": mae_vec,
-        "mse_per_target": mse_vec,
-        "r2_per_target": r2_vec,
-        "mae": float(np.nanmean(mae_vec)),
-        "mse": float(np.nanmean(mse_vec)),
-        "r2": float(np.nanmean(r2_vec)),
-        "n": int(yt.shape[0]),
-        "t": int(yt.shape[1]),
+    mean_row = {
+        "target": "__mean__",
+        "MAE": float(np.mean([r["MAE"] for r in rows])),
+        "MSE": float(np.mean([r["MSE"] for r in rows])),
+        "R2": float(np.mean([r["R2"] for r in rows])),
     }
-    return out
+    return {"per_target": rows, "mean": mean_row}
 
 
-
-def _set_requires_grad(params, flag: bool):
-    for p in params:
-        p.requires_grad = flag
-
-
-def _filter_trainable(params):
-    return [p for p in params if getattr(p, "requires_grad", False)]
+def _unwrap_dataset(ds):
+    # handle torch.utils.data.Subset nesting
+    while hasattr(ds, "dataset"):
+        ds = ds.dataset
+    return ds
 
 
-def _apply_temperature_to_weights(w: torch.Tensor, tau: float) -> torch.Tensor:
+def _gate_and_expert_params(model) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     """
-    w: (B,4) probability weights (softmax output)
-    tau: temperature; <1 => sharper, >1 => smoother
-    Using: softmax(log(w)/tau) == normalize(w^(1/tau))
+    Return (gate_params, expert_params) for both non-cascade and cascade models.
+    """
+    gate_params = []
+    expert_params = []
+
+    if hasattr(model, "head_all"):
+        gate_params += list(model.head_all.gate.parameters())
+        expert_params += list(model.head_all.expert_gas.parameters())
+        expert_params += list(model.head_all.expert_liq.parameters())
+        expert_params += list(model.head_all.expert_crit.parameters())
+        expert_params += list(model.head_all.expert_extra.parameters())
+        return gate_params, expert_params
+
+    # cascade
+    if hasattr(model, "head_z"):
+        gate_params += list(model.head_z.gate.parameters())
+        expert_params += list(model.head_z.expert_gas.parameters())
+        expert_params += list(model.head_z.expert_liq.parameters())
+        expert_params += list(model.head_z.expert_crit.parameters())
+        expert_params += list(model.head_z.expert_extra.parameters())
+    if hasattr(model, "head_props"):
+        gate_params += list(model.head_props.gate.parameters())
+        expert_params += list(model.head_props.expert_gas.parameters())
+        expert_params += list(model.head_props.expert_liq.parameters())
+        expert_params += list(model.head_props.expert_crit.parameters())
+        expert_params += list(model.head_props.expert_extra.parameters())
+
+    return gate_params, expert_params
+
+
+def _apply_temperature(w: torch.Tensor, tau: float) -> torch.Tensor:
+    """
+    tau < 1 => sharper; tau > 1 => smoother.
     """
     tau = float(max(tau, 1e-6))
     w_pow = torch.pow(torch.clamp(w, 1e-12, 1.0), 1.0 / tau)
@@ -62,872 +93,303 @@ def _apply_temperature_to_weights(w: torch.Tensor, tau: float) -> torch.Tensor:
     return w_tau
 
 
-def _temperature_schedule(cfg, stage: str, epoch: int, total_epochs: int) -> float:
-    """
-    stage: "stage2" or "finetune"
-
-    Priority:
-      1) training.temperature_schedule.<stage>.{start,end,mode}
-      2) training.gate_temp_start / gate_temp_end / gate_temp_mode  (兼容你当前 config)
-      3) default 1.0
-    """
-    training = cfg.get("training", {}) or {}
-
-    ts = training.get("temperature_schedule", {}) or {}
-    st = ts.get(stage, None)
-
-    if st is not None:
-        start = float(st.get("start", 1.0))
-        end = float(st.get("end", 1.0))
-        mode = str(st.get("mode", "linear")).lower()
-    else:
-        start = float(training.get("gate_temp_start", 1.0))
-        end = float(training.get("gate_temp_end", 1.0))
-        mode = str(training.get("gate_temp_mode", "linear")).lower()
-
-    if total_epochs <= 1:
-        return float(end)
-
-    t = (epoch - 1) / (total_epochs - 1)
-
-    if mode in ["linear", "lin"]:
-        tau = start + (end - start) * t
-    elif mode in ["exp", "exponential"]:
-        s = max(start, 1e-8)
-        e = max(end, 1e-8)
-        tau = s * ((e / s) ** t)
-    else:
-        tau = start
-
-    return float(tau)
+def _fused_from_experts(w: torch.Tensor, expert_outputs: torch.Tensor) -> torch.Tensor:
+    # w: (B,4), expert_outputs: (B,4,T) -> (B,T)
+    return torch.sum(w.unsqueeze(-1) * expert_outputs, dim=1)
 
 
-def _build_lr_scheduler(cfg, optimizer, stage: str, total_epochs: int, steps_per_epoch: int):
-    """
-    Returns (scheduler_or_None, interval_str) where interval_str in {"epoch","batch"}.
-
-    Supported:
-      - cosine
-      - step
-      - exponential
-      - reduce_on_plateau  (兼容 torch 版本：verbose 参数自动检测)
-      - onecycle
-    """
-    training_cfg = cfg.get("training", {}) or {}
-    sched_cfg = (training_cfg.get("lr_schedule", {}) or {})
-    stage_cfg = sched_cfg.get(stage, None)
-    if not stage_cfg:
-        return None, "epoch"
-
-    name = str(stage_cfg.get("name", "")).lower().strip()
-    interval = str(stage_cfg.get("interval", "epoch")).lower().strip()
-
-    if name in ["none", "off", ""]:
-        return None, interval
-
-    if name in ["cosine", "cosineannealing", "cosineannealinglr"]:
-        eta_min = float(stage_cfg.get("eta_min", 1e-6))
-        t_max = int(stage_cfg.get("t_max", total_epochs))
-        t_max = max(t_max, 1)
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=t_max, eta_min=eta_min
-        ), interval
-
-    if name in ["step", "steplr"]:
-        step_size = int(stage_cfg.get("step_size", max(total_epochs // 3, 1)))
-        gamma = float(stage_cfg.get("gamma", 0.5))
-        return torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=step_size, gamma=gamma
-        ), interval
-
-    if name in ["exp", "exponential", "exponentiallr"]:
-        gamma = float(stage_cfg.get("gamma", 0.98))
-        return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma), interval
-
-    if name in ["reduce_on_plateau", "plateau", "reducelronplateau"]:
-        factor = float(stage_cfg.get("factor", 0.5))
-        patience = int(stage_cfg.get("patience", 10))
-        min_lr = float(stage_cfg.get("min_lr", 1e-6))
-        mode = str(stage_cfg.get("mode", "min"))
-        threshold = float(stage_cfg.get("threshold", 1e-4))
-        cooldown = int(stage_cfg.get("cooldown", 0))
-        eps = float(stage_cfg.get("eps", 1e-8))
-
-        kwargs = dict(
-            optimizer=optimizer,
-            mode=mode,
-            factor=factor,
-            patience=patience,
-            threshold=threshold,
-            cooldown=cooldown,
-            min_lr=min_lr,
-            eps=eps,
-        )
-        sig = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau.__init__)
-        if "verbose" in sig.parameters:
-            kwargs["verbose"] = bool(stage_cfg.get("verbose", True))
-
-        return torch.optim.lr_scheduler.ReduceLROnPlateau(**kwargs), interval
-
-    if name in ["onecycle", "onecyclelr"]:
-        interval = "batch"
-        max_lr = stage_cfg.get("max_lr", None)
-        if max_lr is None:
-            max_lr = optimizer.param_groups[0]["lr"]
-        max_lr = float(max_lr)
-
-        pct_start = float(stage_cfg.get("pct_start", 0.3))
-        div_factor = float(stage_cfg.get("div_factor", 25.0))
-        final_div_factor = float(stage_cfg.get("final_div_factor", 1e4))
-        anneal_strategy = str(stage_cfg.get("anneal_strategy", "cos"))
-
-        total_steps = int(total_epochs * max(steps_per_epoch, 1))
-        total_steps = max(total_steps, 1)
-
-        return torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lr,
-            total_steps=total_steps,
-            pct_start=pct_start,
-            div_factor=div_factor,
-            final_div_factor=final_div_factor,
-            anneal_strategy=anneal_strategy,
-        ), interval
-
-    return None, interval
-
-
-def _is_plateau_scheduler(scheduler) -> bool:
-    return isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
-
-
-def _step_scheduler(scheduler, interval: str, when: str, metric: float = None):
-    """
-    when: "batch" or "epoch_end"
-    interval: "batch" or "epoch"
-    """
-    if scheduler is None:
-        return
-    interval = (interval or "epoch").lower().strip()
-    if interval == "batch" and when == "batch":
-        scheduler.step()
-        return
-    if interval == "epoch" and when == "epoch_end":
-        if _is_plateau_scheduler(scheduler):
-            if metric is None:
-                return
-            scheduler.step(metric)
-        else:
-            scheduler.step()
-
-
-def _eval_pretrain_expert_metrics(model, val_loader, device):
-    """
-    Pretrain评估：
-      - 每个专家在自己子集(expert_id==k)上的 MAE/MSE/R2
-      - overall：按 expert_id 硬路由选对应专家输出，在全验证集上算一次
-    """
+@torch.no_grad()
+def _eval_loss_and_metrics(model, loader, criterion, device, *, target_cols: list[str] | None):
     model.eval()
-    buf = {1: {"y": [], "p": []}, 2: {"y": [], "p": []}, 3: {"y": [], "p": []}, 4: {"y": [], "p": []}}
-    overall_y, overall_p = [], []
+    ys, ps = [], []
+    total_loss = 0.0
+    n_batches = 0
+    for x, y, expert_id in loader:
+        x = x.to(device)
+        y = y.to(device)
+        expert_id = expert_id.to(device)
 
-    with torch.no_grad():
-        for batch in val_loader:
-            if len(batch) != 3:
-                continue
-            x, y, expert_ids = batch
-            x = x.to(device)
-            y = y.to(device)
-            expert_ids = expert_ids.to(device).long()
+        out = model(x)
+        preds = out["fused"]
+        gate_w = out["gate_w"].get("all", None)
+        if gate_w is None:
+            # cascade: we do not re-apply temperature during eval here; pass both heads for entropy if needed
+            gate_w = out["gate_w"]
 
-            out = model(x)
-            if isinstance(out, (list, tuple)) and len(out) >= 3:
-                expert_outputs = out[2]
-            elif isinstance(out, dict) and "expert_outputs" in out:
-                expert_outputs = out["expert_outputs"]
-            else:
-                raise RuntimeError("Model forward should return expert_outputs for pretrain metrics.")
+        loss, *_ = criterion(preds, y, expert_id=expert_id, gate_w=gate_w)
+        total_loss += float(loss.item())
+        n_batches += 1
 
-            for k in [1, 2, 3, 4]:
-                mask = (expert_ids == k)
-                if mask.any():
-                    yk = y[mask].detach().cpu().numpy()
-                    pk = expert_outputs[mask, k - 1].detach().cpu().numpy()
-                    buf[k]["y"].append(yk)
-                    buf[k]["p"].append(pk)
+        ys.append(y.detach().cpu().numpy())
+        ps.append(preds.detach().cpu().numpy())
 
-            idx = (expert_ids - 1).view(-1, 1, 1).expand(-1, 1, expert_outputs.size(-1))
-            sel = expert_outputs.gather(1, idx).squeeze(1)
-            overall_y.append(y.detach().cpu().numpy())
-            overall_p.append(sel.detach().cpu().numpy())
-
-    rows = []
-    for k in [1, 2, 3, 4]:
-        if len(buf[k]["y"]) == 0:
-            rows.append({"expert": str(k), "n": 0, "mae": np.nan, "mse": np.nan, "r2": np.nan})
-            continue
-        yt = np.concatenate(buf[k]["y"], axis=0)
-        yp = np.concatenate(buf[k]["p"], axis=0)
-        rows.append({
-            "expert": str(k),
-            "n": int(yt.shape[0]),
-            "mae": float(compute_metrics(yt, yp)['mae']),
-            "mse": float(compute_metrics(yt, yp)['mse']),
-            "r2": float(compute_metrics(yt, yp)['r2']),
-        })
-
-    if len(overall_y) == 0:
-        rows.append({"expert": "hard_routed_overall", "n": 0, "mae": np.nan, "mse": np.nan, "r2": np.nan})
-    else:
-        yt = np.concatenate(overall_y, axis=0)
-        yp = np.concatenate(overall_p, axis=0)
-        rows.append({
-            "expert": "hard_routed_overall",
-            "n": int(yt.shape[0]),
-            "mae": float(compute_metrics(yt, yp)['mae']),
-            "mse": float(compute_metrics(yt, yp)['mse']),
-            "r2": float(compute_metrics(yt, yp)['r2']),
-        })
-
-    return rows
-
-
-def _make_optimizer(kind: str, params, lr: float, betas=(0.9, 0.999), weight_decay: float = 0.0):
-    kind = (kind or "adam").lower().strip()
-    lr = float(lr)
-    weight_decay = float(weight_decay)
-
-    if kind == "adamw":
-        return torch.optim.AdamW(params, lr=lr, betas=betas, weight_decay=weight_decay)
-    if kind == "adam":
-        # torch Adam 的 weight_decay 是 L2（不是 decoupled），但依然可用；这里保持为 0 更保险
-        return torch.optim.Adam(params, lr=lr, betas=betas, weight_decay=weight_decay)
-    if kind == "sgd":
-        momentum = betas[0] if betas else 0.9
-        return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
-    # fallback
-    return torch.optim.AdamW(params, lr=lr, betas=betas, weight_decay=weight_decay)
+    y_true = np.concatenate(ys, axis=0) if ys else np.zeros((0, 1))
+    y_pred = np.concatenate(ps, axis=0) if ps else np.zeros((0, 1))
+    metrics = _compute_metrics(y_true, y_pred, target_cols)
+    return total_loss / max(n_batches, 1), metrics
 
 
 def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
     """
-    Stage 1: pretrain experts (hard routing by expert_id / 'no')
-    Stage 2: train gate + MoE (experts frozen)  -> 默认 AdamW + gate_weight_decay
-    Stage 3: optional finetune (unfreeze gate + selected experts) -> 默认 AdamW + finetune_weight_decay
+    3-stage training loop (kept consistent with your existing pipeline):
+      Stage1: pretrain experts with hard routing by 'no'
+      Stage2: train gate(s) (experts frozen), with optional temperature schedule
+      Finetune: joint training, optional partial unfreeze
+
+    PINN thermo constraints are injected in Stage2 and Finetune only (default).
     """
     save_dir = cfg["paths"]["save_dir"]
-    os.makedirs(f"{save_dir}/checkpoints", exist_ok=True)
-    os.makedirs(f"{save_dir}/plots", exist_ok=True)
-    os.makedirs(f"{save_dir}/logs", exist_ok=True)
+    ckpt_dir = os.path.join(save_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     train_loader = dataloaders["train"]
     val_loader = dataloaders["val"]
-    steps_per_epoch = len(train_loader) if hasattr(train_loader, "__len__") else 1
 
-    total_epochs = int(cfg["training"]["epochs"])
-    pretrain_epochs = int(cfg["training"].get("pretrain_epochs", 0))
-    patience = int(cfg["training"]["early_stopping_patience"])
+    base_ds = _unwrap_dataset(train_loader.dataset)
+    feature_cols = list(getattr(base_ds, "feature_cols", []))
+    target_cols = list(getattr(base_ds, "target_cols", []))
 
-    # collect params
-    expert_params = []
-    if hasattr(model, "expert_gas"):
-        expert_params += list(model.expert_gas.parameters())
-    if hasattr(model, "expert_liq"):
-        expert_params += list(model.expert_liq.parameters())
-    if hasattr(model, "expert_crit"):
-        expert_params += list(model.expert_crit.parameters())
-    if hasattr(model, "expert_extra"):
-        expert_params += list(model.expert_extra.parameters())
+    # scaler params for PINN conversion
+    scaler_mean = torch.tensor(getattr(base_ds, "scaler_mean", np.zeros(len(feature_cols))), dtype=torch.float32)
+    scaler_scale = torch.tensor(getattr(base_ds, "scaler_scale", np.ones(len(feature_cols))), dtype=torch.float32)
 
-    gate_params = list(model.gate.parameters())
-
-    base_lr = float(cfg["training"]["learning_rate"])
-
-    # ---------- Stage1 optimizer (experts) ----------
-    pre_opt_kind = str(cfg["training"].get("pretrain_optimizer", "adam")).lower()
-    pre_weight_decay = float(cfg["training"].get("pretrain_weight_decay", 0.0))
-    optim_experts = None
-    if pretrain_epochs > 0:
-        optim_experts = _make_optimizer(
-            pre_opt_kind, expert_params, lr=base_lr, betas=(0.9, 0.999), weight_decay=pre_weight_decay
-        )
-
-    # ---------- Stage2 optimizer (gate) : 必要修改点 ----------
-    gate_opt_kind = str(cfg["training"].get("gate_optimizer", "adamw")).lower()
-    gate_weight_decay = float(cfg["training"].get("gate_weight_decay", 1e-4))
-    gate_betas = cfg["training"].get("gate_betas", [0.9, 0.99])
-    gate_betas = (float(gate_betas[0]), float(gate_betas[1])) if isinstance(gate_betas, (list, tuple)) and len(gate_betas) >= 2 else (0.9, 0.99)
-
-    optim_gate = _make_optimizer(
-        gate_opt_kind, gate_params, lr=base_lr, betas=gate_betas, weight_decay=gate_weight_decay
+    pinn_loss = ThermoPinnLoss(
+        cfg,
+        feature_cols=feature_cols,
+        target_cols=target_cols,
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
+        device=device,
     )
 
-    # ---------- schedulers ----------
-    sched_pre, sched_pre_interval = (None, "epoch")
-    if optim_experts is not None:
-        sched_pre, sched_pre_interval = _build_lr_scheduler(cfg, optim_experts, "pretrain", pretrain_epochs, steps_per_epoch)
+    training = cfg.get("training", {}) or {}
 
-    sched_gate, sched_gate_interval = _build_lr_scheduler(cfg, optim_gate, "stage2", total_epochs, steps_per_epoch)
+    # Backward/forward compatible epoch keys
+    pretrain_epochs = int(training.get("stage1_epochs", training.get("pretrain_epochs", 0)))
 
-    # ---------- records ----------
-    train_losses, val_losses = [], []
-    mse_list, nonneg_list, smooth_list, entropy_list = [], [], [], []
-    gate_e1_list, gate_e2_list, gate_e3_list, gate_e4_list = [], [], [], []
-    train_mae_list, val_mae_list = [], []
-    train_mse_metric_list, val_mse_metric_list = [], []
-    train_r2_list, val_r2_list = [], []
+    # Stage2 (gate training) epochs: support multiple naming styles
+    stage2_epochs = training.get("stage2_epochs", None)
+    if stage2_epochs is None:
+        stage2_epochs = (training.get("stage2", {}) or {}).get("epochs", None)
+    if stage2_epochs is None:
+        stage2_epochs = training.get("gate_epochs", None)
+    if stage2_epochs is None:
+        stage2_epochs = training.get("epochs", 0)
+    stage2_epochs = int(stage2_epochs)
 
-    pretrain_metrics_rows = []
+    # Finetune epochs: support nested finetune block
+    finetune_epochs = training.get("finetune_epochs", None)
+    if finetune_epochs is None:
+        finetune_block = (training.get("finetune", {}) or {})
+        if finetune_block.get("enabled", False):
+            finetune_epochs = finetune_block.get("epochs", 0)
+        else:
+            finetune_epochs = 0
+    finetune_epochs = int(finetune_epochs)
+    base_lr = float(training.get("learning_rate", 1e-3))
+    clip_grad = float(training.get("clip_grad_norm", 5.0))
+    tau_stage2 = float(training.get("temperature", 1.0))
 
-    # ===================== Stage 1: Pretrain experts =====================
-    if pretrain_epochs > 0:
-        logger.info(f"=== Stage 1: Pretraining experts for {pretrain_epochs} epochs (hard routing by 'no') ===")
-        _set_requires_grad(gate_params, False)
-        _set_requires_grad(expert_params, True)
+    # params split
+    gate_params, expert_params = _gate_and_expert_params(model)
 
-        for epoch in range(1, pretrain_epochs + 1):
+    # Stage-specific optimizers
+    opt_experts = torch.optim.Adam(expert_params, lr=base_lr) if expert_params else None
+    opt_gates = torch.optim.Adam(gate_params, lr=base_lr) if gate_params else None
+    opt_joint = optimizer  # keep your external optimizer for finetune
+
+    best_val = float("inf")
+    best_path = os.path.join(ckpt_dir, "best_model.pt")
+
+    def _save(tag: str):
+        p = os.path.join(ckpt_dir, f"{tag}.pt")
+        torch.save(model.state_dict(), p)
+        return p
+
+    # ---------------- Stage 1: Pretrain experts (hard routing by expert_id) ----------------
+    if pretrain_epochs > 0 and opt_experts is not None:
+        logger.info(f"=== Stage 1: Pretrain experts ({pretrain_epochs} epochs) ===")
+        # freeze gates
+        for p in gate_params:
+            p.requires_grad = False
+        for p in expert_params:
+            p.requires_grad = True
+
+        for epoch in range(pretrain_epochs):
             model.train()
-            running_loss = 0.0
+            running = 0.0
             n_batches = 0
 
-            for batch in train_loader:
-                if len(batch) != 3:
-                    raise RuntimeError("Pretraining requires (x, y, expert_id) in dataset.")
-                x, y, expert_ids = batch
+            for x, y, expert_id in train_loader:
                 x = x.to(device)
                 y = y.to(device)
-                expert_ids = expert_ids.to(device).long()
-
-                optim_experts.zero_grad()
+                expert_id = expert_id.to(device).view(-1)  # (B,)
 
                 out = model(x)
-                if isinstance(out, (list, tuple)) and len(out) >= 3:
-                    expert_outputs = out[2]
-                elif isinstance(out, dict) and "expert_outputs" in out:
-                    expert_outputs = out["expert_outputs"]
+                # hard routing: pick expert output based on expert_id
+                if out["aux"]["cascade"]:
+                    # Z head: target is only Z
+                    z_idx = int(out["aux"]["z_out_idx"])
+                    y_z = y[:, z_idx:z_idx+1]
+                    exps_z = out["expert_outputs"]["z"]  # (B,4,1)
+                    sel_z = exps_z[torch.arange(x.shape[0], device=device), torch.clamp(expert_id-1,0,3)]
+                    # props head
+                    other_inds = out["aux"]["other_indices"]
+                    y_p = y[:, other_inds]
+                    exps_p = out["expert_outputs"]["props"]  # (B,4,To)
+                    sel_p = exps_p[torch.arange(x.shape[0], device=device), torch.clamp(expert_id-1,0,3)]
+
+                    loss_z, *_ = criterion(sel_z, y_z, expert_id=expert_id, gate_w=None)
+                    loss_p, *_ = criterion(sel_p, y_p, expert_id=expert_id, gate_w=None)
+                    loss = loss_z + loss_p
                 else:
-                    raise RuntimeError("Model forward should return expert_outputs in pretrain stage.")
+                    exps = out["expert_outputs"]["all"]  # (B,4,T)
+                    sel = exps[torch.arange(x.shape[0], device=device), torch.clamp(expert_id-1,0,3)]
+                    loss, *_ = criterion(sel, y, expert_id=expert_id, gate_w=None)
 
-                idx = expert_ids - 1
-                idx3 = idx.view(-1, 1, 1).expand(-1, 1, expert_outputs.size(-1))
-                selected = expert_outputs.gather(1, idx3).squeeze(1)  # (B,T)
-
-                loss, data_loss, nonneg, smooth, entropy = criterion(selected, y, expert_id=expert_ids, gate_w=None)
+                opt_experts.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(expert_params, 5.0)
-                optim_experts.step()
+                torch.nn.utils.clip_grad_norm_(expert_params, clip_grad)
+                opt_experts.step()
 
-                _step_scheduler(sched_pre, sched_pre_interval, when="batch")
-
-                running_loss += loss.item()
+                running += float(loss.item())
                 n_batches += 1
 
-            avg_loss = running_loss / max(n_batches, 1)
-            _step_scheduler(sched_pre, sched_pre_interval, when="epoch_end")
+            val_loss, val_metrics = _eval_loss_and_metrics(model, val_loader, criterion, device, target_cols=target_cols)
+            logger.info(f"[Stage1][{epoch+1}/{pretrain_epochs}] train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
+                        f"val_R2_mean={val_metrics['mean']['R2']:.4f}")
 
-            rows = _eval_pretrain_expert_metrics(model, val_loader, device)
-            for r in rows:
-                pretrain_metrics_rows.append({
-                    "epoch": epoch,
-                    "expert": r["expert"],
-                    "n": r["n"],
-                    "mae": r["mae"],
-                    "mse": r["mse"],
-                    "r2": r["r2"],
-                    "lr": float(optim_experts.param_groups[0]["lr"]),
-                    "train_loss": float(avg_loss),
-                })
+    # ---------------- Stage 2: Train gate(s) ----------------
+    if stage2_epochs > 0 and opt_gates is not None:
+        logger.info(f"=== Stage 2: Train gate(s) ({stage2_epochs} epochs) ===")
+        # freeze experts, unfreeze gates
+        for p in expert_params:
+            p.requires_grad = False
+        for p in gate_params:
+            p.requires_grad = True
 
-            msg = f"[Pretrain] Epoch {epoch}/{pretrain_epochs} TrainLoss={avg_loss:.6f} LR={optim_experts.param_groups[0]['lr']:.3e} | "
-            parts = []
-            for r in rows:
-                tag = "Overall" if r["expert"] == "hard_routed_overall" else f"E{r['expert']}"
-                parts.append(f"{tag}: n={r['n']} MAE={r['mae']:.4g} MSE={r['mse']:.4g} R2={r['r2']:.4g}")
-            logger.info(msg + " ; ".join(parts))
+        for epoch in range(stage2_epochs):
+            model.train()
+            running = 0.0
+            n_batches = 0
 
-        df_pre = pd.DataFrame(pretrain_metrics_rows)
-        df_pre.to_csv(f"{save_dir}/plots/pretrain_expert_metrics.csv", index=False)
-
-        _set_requires_grad(expert_params, False)
-        _set_requires_grad(gate_params, True)
-    else:
-        # 如果没有预训练，也建议 Stage2 只训 gate（否则会马上一锅端把专家也训练了，风险大）
-        _set_requires_grad(expert_params, False)
-        _set_requires_grad(gate_params, True)
-
-    # ===================== Stage 2: Train gate with early stopping =====================
-    logger.info(f"=== Stage 2: Training gate + MoE for up to {total_epochs} epochs with early stopping ===")
-    best_val = float("inf")
-    epochs_no_improve = 0
-
-    for epoch in range(1, total_epochs + 1):
-        tau = _temperature_schedule(cfg, "stage2", epoch, total_epochs)
-
-        model.train()
-        running_train_loss = 0.0
-        mse_epoch = 0.0
-        nonneg_epoch = 0.0
-        smooth_epoch = 0.0
-        entropy_epoch = 0.0
-        n_batches = 0
-        w_accum = None
-
-        train_y_true, train_y_pred = [], []
-
-        for batch in train_loader:
-            expert_ids = None
-            if len(batch) == 3:
-                x, y, expert_ids = batch
-            elif len(batch) == 2:
-                x, y = batch
-            else:
-                raise RuntimeError("Unexpected batch format in training stage.")
-            x = x.to(device)
-            y = y.to(device)
-            if expert_ids is not None:
-                expert_ids = expert_ids.to(device).long()
-
-            optim_gate.zero_grad()
-
-            out = model(x)
-            if isinstance(out, (list, tuple)) and len(out) >= 3:
-                w_raw, expert_outputs = out[1], out[2]
-            elif isinstance(out, dict):
-                w_raw = out.get("w_raw", None) or out.get("gate_w", None)
-                expert_outputs = out.get("expert_outputs", None)
-                if w_raw is None or expert_outputs is None:
-                    raise RuntimeError("Model output dict missing gate weights or expert outputs.")
-            else:
-                raise RuntimeError("Unexpected model forward output format.")
-
-            w_tau = _apply_temperature_to_weights(w_raw, tau)
-            preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
-
-            loss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(gate_params, 5.0)
-            optim_gate.step()
-
-            _step_scheduler(sched_gate, sched_gate_interval, when="batch")
-
-            running_train_loss += loss.item()
-            mse_epoch += float(data_loss.item())
-            nonneg_epoch += float(nonneg.item())
-            smooth_epoch += float(smooth.item())
-            entropy_epoch += float(entropy.item())
-            n_batches += 1
-
-            train_y_true.append(y.detach().cpu().numpy())
-            train_y_pred.append(preds.detach().cpu().numpy())
-
-            w_mean_batch = w_tau.mean(dim=0)
-            w_accum = w_mean_batch.detach() if w_accum is None else (w_accum + w_mean_batch.detach())
-
-        train_loss = running_train_loss / max(n_batches, 1)
-        mse_epoch /= max(n_batches, 1)
-        nonneg_epoch /= max(n_batches, 1)
-        smooth_epoch /= max(n_batches, 1)
-        entropy_epoch /= max(n_batches, 1)
-
-        train_y_true_np = np.concatenate(train_y_true, axis=0)
-        train_y_pred_np = np.concatenate(train_y_pred, axis=0)
-        _m_tr = compute_metrics(train_y_true_np, train_y_pred_np)
-        train_mae = _m_tr['mae']
-        train_mse_metric = _m_tr['mse']
-        train_r2 = _m_tr['r2']
-
-        # ----- validation -----
-        model.eval()
-        running_val_loss = 0.0
-        n_val_batches = 0
-        val_y_true, val_y_pred = [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                expert_ids = None
-                if len(batch) == 3:
-                    x, y, expert_ids = batch
-                elif len(batch) == 2:
-                    x, y = batch
-                else:
-                    raise RuntimeError("Unexpected batch format in validation stage.")
+            for x, y, expert_id in train_loader:
                 x = x.to(device)
                 y = y.to(device)
-                if expert_ids is not None:
-                    expert_ids = expert_ids.to(device).long()
+                expert_id = expert_id.to(device).view(-1)
+
+                if pinn_loss.enabled:
+                    x = x.clone().detach().requires_grad_(True)
 
                 out = model(x)
-                if isinstance(out, (list, tuple)) and len(out) >= 3:
-                    w_raw, expert_outputs = out[1], out[2]
-                elif isinstance(out, dict):
-                    w_raw = out.get("w_raw", None) or out.get("gate_w", None)
-                    expert_outputs = out.get("expert_outputs", None)
-                    if w_raw is None or expert_outputs is None:
-                        raise RuntimeError("Model output dict missing gate weights or expert outputs.")
+
+                if out["aux"]["cascade"]:
+                    # apply temperature per head and recompute fused
+                    w_z = _apply_temperature(out["gate_w"]["z"], tau_stage2)
+                    w_p = _apply_temperature(out["gate_w"]["props"], tau_stage2)
+                    z_tau = _fused_from_experts(w_z, out["expert_outputs"]["z"])  # (B,1)
+                    p_tau = _fused_from_experts(w_p, out["expert_outputs"]["props"])  # (B,To)
+
+                    # assemble
+                    preds = out["fused"].clone()
+                    z_idx = int(out["aux"]["z_out_idx"])
+                    preds[:, z_idx:z_idx+1] = z_tau
+                    preds[:, out["aux"]["other_indices"]] = p_tau
+
+                    gate_w_for_loss = {"z": w_z, "props": w_p}
                 else:
-                    raise RuntimeError("Unexpected model forward output format.")
+                    w_tau = _apply_temperature(out["gate_w"]["all"], tau_stage2)
+                    preds = _fused_from_experts(w_tau, out["expert_outputs"]["all"])
+                    gate_w_for_loss = w_tau
 
-                w_tau = _apply_temperature_to_weights(w_raw, tau)
-                preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
+                loss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_id, gate_w=gate_w_for_loss)
 
-                vloss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
-                running_val_loss += vloss.item()
-                n_val_batches += 1
+                pinn_term = torch.tensor(0.0, device=device)
+                pinn_parts = {}
+                if pinn_loss.enabled:
+                    pinn_term, pinn_parts = pinn_loss(x, preds)
+                    loss = loss + pinn_term
 
-                val_y_true.append(y.detach().cpu().numpy())
-                val_y_pred.append(preds.detach().cpu().numpy())
+                opt_gates.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(gate_params, clip_grad)
+                opt_gates.step()
 
-        val_loss = running_val_loss / max(n_val_batches, 1)
+                running += float(loss.item())
+                n_batches += 1
 
-        val_y_true_np = np.concatenate(val_y_true, axis=0)
-        val_y_pred_np = np.concatenate(val_y_pred, axis=0)
-        _m_va = compute_metrics(val_y_true_np, val_y_pred_np)
-        val_mae = _m_va['mae']
-        val_mse_metric = _m_va['mse']
-        val_r2 = _m_va['r2']
+            val_loss, val_metrics = _eval_loss_and_metrics(model, val_loader, criterion, device, target_cols=target_cols)
+            logger.info(f"[Stage2][{epoch+1}/{stage2_epochs}] train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
+                        f"val_R2_mean={val_metrics['mean']['R2']:.4f}")
 
-        _step_scheduler(sched_gate, sched_gate_interval, when="epoch_end", metric=val_loss)
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(model.state_dict(), best_path)
 
-        if w_accum is not None:
-            w_mean = (w_accum / max(n_batches, 1)).cpu().numpy()
-            gate_e1_list.append(float(w_mean[0]))
-            gate_e2_list.append(float(w_mean[1]))
-            gate_e3_list.append(float(w_mean[2]))
-            gate_e4_list.append(float(w_mean[3]))
-        else:
-            gate_e1_list.append(0.0)
-            gate_e2_list.append(0.0)
-            gate_e3_list.append(0.0)
-            gate_e4_list.append(0.0)
-
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        mse_list.append(mse_epoch)
-        nonneg_list.append(nonneg_epoch)
-        smooth_list.append(smooth_epoch)
-        entropy_list.append(entropy_epoch)
-        train_mae_list.append(train_mae)
-        val_mae_list.append(val_mae)
-        train_mse_metric_list.append(train_mse_metric)
-        val_mse_metric_list.append(val_mse_metric)
-        train_r2_list.append(train_r2)
-        val_r2_list.append(val_r2)
-
-        logger.info(
-            f"[Epoch {epoch}/{total_epochs}] tau={tau:.3f} "
-            f"LR={optim_gate.param_groups[0]['lr']:.3e} "
-            f"TrainLoss={train_loss:.6f} ValLoss={val_loss:.6f} "
-            f"MSE={mse_epoch:.6f} NonNeg={nonneg_epoch:.6f} Smooth={smooth_epoch:.6f} Entropy={entropy_epoch:.6f} "
-            f"TrainMAE={train_mae:.6f} ValMAE={val_mae:.6f} "
-            f"TrainR2={train_r2:.4f} ValR2={val_r2:.4f}"
-        )
-
-        if val_loss < best_val - 1e-6:
-            best_val = val_loss
-            epochs_no_improve = 0
-            torch.save(model.state_dict(), f"{save_dir}/checkpoints/best_model.pt")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                logger.info(f"Early stopping triggered at epoch {epoch}. Best ValLoss={best_val:.6f}")
-                break
-
-    # ===================== Stage 3: Finetune (optional) =====================
-    finetune_epochs = int(cfg["training"].get("finetune_epochs", 0))
+    # ---------------- Finetune: Joint training ----------------
     if finetune_epochs > 0:
-        logger.info(f"=== Stage 3: Joint finetuning for {finetune_epochs} epochs (unfreeze gate + selected experts) ===")
+        logger.info(f"=== Finetune: Joint training ({finetune_epochs} epochs) ===")
+        for p in gate_params + expert_params:
+            p.requires_grad = True
 
-        best_ckpt = f"{save_dir}/checkpoints/best_model.pt"
-        if os.path.exists(best_ckpt):
-            model.load_state_dict(torch.load(best_ckpt, map_location=device))
+        for epoch in range(finetune_epochs):
+            model.train()
+            running = 0.0
+            n_batches = 0
 
-        _set_requires_grad(gate_params, True)
-        _set_requires_grad(expert_params, False)
+            for x, y, expert_id in train_loader:
+                x = x.to(device)
+                y = y.to(device)
+                expert_id = expert_id.to(device).view(-1)
 
-        ft_lr_gate = float(cfg["training"].get("finetune_lr_gate", base_lr * 0.5))
-        ft_lr_expert = float(cfg["training"].get("finetune_lr_expert", base_lr * 0.2))
+                if pinn_loss.enabled:
+                    x = x.clone().detach().requires_grad_(True)
 
-        ft_unfreeze = cfg["training"].get("finetune_unfreeze", ["liq"])
-        ft_unfreeze = [str(x).lower() for x in (ft_unfreeze or [])]
+                out = model(x)
+                preds = out["fused"]
+                gate_w = out["gate_w"].get("all", None)
+                if gate_w is None:
+                    gate_w = out["gate_w"]
 
-        def _match(key: str) -> bool:
-            if "all" in ft_unfreeze:
-                return True
-            for it in ft_unfreeze:
-                if it in key:
-                    return True
-            return False
+                loss, *_ = criterion(preds, y, expert_id=expert_id, gate_w=gate_w)
+                if pinn_loss.enabled:
+                    pinn_term, _ = pinn_loss(x, preds)
+                    loss = loss + pinn_term
 
-        expert_param_groups = []
-        if hasattr(model, "expert_gas") and _match("gas"):
-            _set_requires_grad(model.expert_gas.parameters(), True)
-            expert_param_groups += list(model.expert_gas.parameters())
-        if hasattr(model, "expert_liq") and _match("liq"):
-            _set_requires_grad(model.expert_liq.parameters(), True)
-            expert_param_groups += list(model.expert_liq.parameters())
-        if hasattr(model, "expert_crit") and _match("crit"):
-            _set_requires_grad(model.expert_crit.parameters(), True)
-            expert_param_groups += list(model.expert_crit.parameters())
-        if hasattr(model, "expert_extra") and _match("extra"):
-            _set_requires_grad(model.expert_extra.parameters(), True)
-            expert_param_groups += list(model.expert_extra.parameters())
+                opt_joint.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(gate_params + expert_params, clip_grad)
+                opt_joint.step()
 
-        params_gate = _filter_trainable(gate_params)
-        params_expert = _filter_trainable(expert_param_groups)
+                running += float(loss.item())
+                n_batches += 1
 
-        if len(params_gate) == 0 and len(params_expert) == 0:
-            logger.info("[Finetune] No trainable params found. Skip finetune stage.")
-        else:
-            ft_opt_kind = str(cfg["training"].get("finetune_optimizer", "adamw")).lower()
-            ft_weight_decay = float(cfg["training"].get("finetune_weight_decay", 5e-5))
-            ft_betas = cfg["training"].get("finetune_betas", [0.9, 0.999])
-            ft_betas = (float(ft_betas[0]), float(ft_betas[1])) if isinstance(ft_betas, (list, tuple)) and len(ft_betas) >= 2 else (0.9, 0.999)
+            val_loss, val_metrics = _eval_loss_and_metrics(model, val_loader, criterion, device, target_cols=target_cols)
+            logger.info(f"[Finetune][{epoch+1}/{finetune_epochs}] train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
+                        f"val_R2_mean={val_metrics['mean']['R2']:.4f}")
 
-            # 分组优化器：gate 和 expert 用不同 lr，但共享同一 optimizer 实例（正常、推荐）
-            if ft_opt_kind == "adamw":
-                optim_joint = torch.optim.AdamW(
-                    [
-                        {"params": params_gate, "lr": ft_lr_gate, "weight_decay": ft_weight_decay},
-                        {"params": params_expert, "lr": ft_lr_expert, "weight_decay": ft_weight_decay},
-                    ],
-                    betas=ft_betas,
-                )
-            elif ft_opt_kind == "adam":
-                optim_joint = torch.optim.Adam(
-                    [
-                        {"params": params_gate, "lr": ft_lr_gate},
-                        {"params": params_expert, "lr": ft_lr_expert},
-                    ],
-                    betas=ft_betas,
-                    weight_decay=ft_weight_decay,
-                )
-            else:
-                optim_joint = _make_optimizer(
-                    ft_opt_kind,
-                    [{"params": params_gate, "lr": ft_lr_gate}, {"params": params_expert, "lr": ft_lr_expert}],
-                    lr=ft_lr_gate,
-                    betas=ft_betas,
-                    weight_decay=ft_weight_decay,
-                )
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(model.state_dict(), best_path)
 
-            sched_ft, sched_ft_interval = _build_lr_scheduler(cfg, optim_joint, "finetune", finetune_epochs, steps_per_epoch)
+    # always save last
+    _save("last_model")
+    if os.path.exists(best_path):
+        logger.info(f"Best model saved: {best_path} (val_loss={best_val:.6f})")
+    else:
+        logger.info("No best model tracked; using last_model.pt")
 
-            for ft_ep in range(1, finetune_epochs + 1):
-                tau = _temperature_schedule(cfg, "finetune", ft_ep, finetune_epochs)
+    # Export a small training summary
+    summary = {
+        "best_val_loss": float(best_val),
+        "best_model_path": best_path if os.path.exists(best_path) else None,
+        "target_cols": target_cols,
+        "feature_cols": feature_cols,
+        "pinn_enabled": bool(pinn_loss.enabled),
+        "pinn_cfg": cfg.get("pinn", {}),
+    }
+    with open(os.path.join(save_dir, "training_summary.json"), "w", encoding="utf-8") as f:
+        import json
+        json.dump(summary, f, ensure_ascii=False, indent=2)
 
-                model.train()
-                running_train_loss = 0.0
-                mse_epoch = 0.0
-                nonneg_epoch = 0.0
-                smooth_epoch = 0.0
-                entropy_epoch = 0.0
-                n_batches = 0
-                w_accum = None
-                train_y_true, train_y_pred = [], []
-
-                for batch in train_loader:
-                    expert_ids = None
-                    if len(batch) == 3:
-                        x, y, expert_ids = batch
-                    elif len(batch) == 2:
-                        x, y = batch
-                    else:
-                        raise RuntimeError("Unexpected batch format in finetune stage.")
-                    x = x.to(device)
-                    y = y.to(device)
-                    if expert_ids is not None:
-                        expert_ids = expert_ids.to(device).long()
-
-                    optim_joint.zero_grad()
-
-                    out = model(x)
-                    if isinstance(out, (list, tuple)) and len(out) >= 3:
-                        w_raw, expert_outputs = out[1], out[2]
-                    elif isinstance(out, dict):
-                        w_raw = out.get("w_raw", None) or out.get("gate_w", None)
-                        expert_outputs = out.get("expert_outputs", None)
-                        if w_raw is None or expert_outputs is None:
-                            raise RuntimeError("Model output dict missing gate weights or expert outputs.")
-                    else:
-                        raise RuntimeError("Unexpected model forward output format.")
-
-                    w_tau = _apply_temperature_to_weights(w_raw, tau)
-                    preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
-
-                    loss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                    optim_joint.step()
-
-                    _step_scheduler(sched_ft, sched_ft_interval, when="batch")
-
-                    running_train_loss += loss.item()
-                    mse_epoch += float(data_loss.item())
-                    nonneg_epoch += float(nonneg.item())
-                    smooth_epoch += float(smooth.item())
-                    entropy_epoch += float(entropy.item())
-                    n_batches += 1
-
-                    train_y_true.append(y.detach().cpu().numpy())
-                    train_y_pred.append(preds.detach().cpu().numpy())
-
-                    w_mean_batch = w_tau.mean(dim=0)
-                    w_accum = w_mean_batch.detach() if w_accum is None else (w_accum + w_mean_batch.detach())
-
-                train_loss = running_train_loss / max(n_batches, 1)
-                mse_epoch /= max(n_batches, 1)
-                nonneg_epoch /= max(n_batches, 1)
-                smooth_epoch /= max(n_batches, 1)
-                entropy_epoch /= max(n_batches, 1)
-
-                train_y_true_np = np.concatenate(train_y_true, axis=0)
-                train_y_pred_np = np.concatenate(train_y_pred, axis=0)
-                _m_tr = compute_metrics(train_y_true_np, train_y_pred_np)
-                train_mae = _m_tr['mae']
-                train_mse_metric = _m_tr['mse']
-                train_r2 = _m_tr['r2']
-
-                model.eval()
-                running_val_loss = 0.0
-                n_val_batches = 0
-                val_y_true, val_y_pred = [], []
-                with torch.no_grad():
-                    for batch in val_loader:
-                        expert_ids = None
-                        if len(batch) == 3:
-                            x, y, expert_ids = batch
-                        elif len(batch) == 2:
-                            x, y = batch
-                        else:
-                            raise RuntimeError("Unexpected batch format in finetune validation.")
-                        x = x.to(device)
-                        y = y.to(device)
-                        if expert_ids is not None:
-                            expert_ids = expert_ids.to(device).long()
-
-                        out = model(x)
-                        if isinstance(out, (list, tuple)) and len(out) >= 3:
-                            w_raw, expert_outputs = out[1], out[2]
-                        elif isinstance(out, dict):
-                            w_raw = out.get("w_raw", None) or out.get("gate_w", None)
-                            expert_outputs = out.get("expert_outputs", None)
-                            if w_raw is None or expert_outputs is None:
-                                raise RuntimeError("Model output dict missing gate weights or expert outputs.")
-                        else:
-                            raise RuntimeError("Unexpected model forward output format.")
-
-                        w_tau = _apply_temperature_to_weights(w_raw, tau)
-                        preds = (w_tau.unsqueeze(-1) * expert_outputs).sum(dim=1)
-
-                        vloss, data_loss, nonneg, smooth, entropy = criterion(preds, y, expert_id=expert_ids, gate_w=w_tau)
-                        running_val_loss += vloss.item()
-                        n_val_batches += 1
-
-                        val_y_true.append(y.detach().cpu().numpy())
-                        val_y_pred.append(preds.detach().cpu().numpy())
-
-                val_loss = running_val_loss / max(n_val_batches, 1)
-
-                val_y_true_np = np.concatenate(val_y_true, axis=0)
-                val_y_pred_np = np.concatenate(val_y_pred, axis=0)
-                _m_va = compute_metrics(val_y_true_np, val_y_pred_np)
-                val_mae = _m_va['mae']
-                val_mse_metric = _m_va['mse']
-                val_r2 = _m_va['r2']
-
-                _step_scheduler(sched_ft, sched_ft_interval, when="epoch_end", metric=val_loss)
-
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-                mse_list.append(mse_epoch)
-                nonneg_list.append(nonneg_epoch)
-                smooth_list.append(smooth_epoch)
-                entropy_list.append(entropy_epoch)
-                train_mae_list.append(train_mae)
-                val_mae_list.append(val_mae)
-                train_mse_metric_list.append(train_mse_metric)
-                val_mse_metric_list.append(val_mse_metric)
-                train_r2_list.append(train_r2)
-                val_r2_list.append(val_r2)
-
-                if w_accum is not None:
-                    w_mean = (w_accum / max(n_batches, 1)).cpu().numpy()
-                    gate_e1_list.append(float(w_mean[0]))
-                    gate_e2_list.append(float(w_mean[1]))
-                    gate_e3_list.append(float(w_mean[2]))
-                    gate_e4_list.append(float(w_mean[3]))
-                else:
-                    gate_e1_list.append(0.0)
-                    gate_e2_list.append(0.0)
-                    gate_e3_list.append(0.0)
-                    gate_e4_list.append(0.0)
-
-                logger.info(
-                    f"[Finetune {ft_ep}/{finetune_epochs}] tau={tau:.3f} "
-                    f"LR={optim_joint.param_groups[0]['lr']:.3e} "
-                    f"TrainLoss={train_loss:.6f} ValLoss={val_loss:.6f} "
-                    f"MSE={mse_epoch:.6f} NonNeg={nonneg_epoch:.6f} Smooth={smooth_epoch:.6f} Entropy={entropy_epoch:.6f} "
-                    f"TrainMAE={train_mae:.6f} ValMAE={val_mae:.6f} "
-                    f"TrainR2={train_r2:.4f} ValR2={val_r2:.4f}"
-                )
-
-    # ===================== Artifacts / plots =====================
-    fig1 = go.Figure()
-    fig1.add_trace(go.Scatter(y=train_losses, name="Train Loss"))
-    fig1.add_trace(go.Scatter(y=val_losses, name="Val Loss"))
-    fig1.update_layout(title="Loss Curve", xaxis_title="Epoch", yaxis_title="Loss")
-    fig1.write_html(f"{save_dir}/plots/loss_curve.html")
-
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(y=mse_list, name="MSE (data term)"))
-    fig2.add_trace(go.Scatter(y=nonneg_list, name="NonNeg"))
-    fig2.add_trace(go.Scatter(y=smooth_list, name="Smooth"))
-    fig2.add_trace(go.Scatter(y=entropy_list, name="Entropy"))
-    fig2.update_layout(title="Loss Components", xaxis_title="Epoch", yaxis_title="Value")
-    fig2.write_html(f"{save_dir}/plots/loss_components.html")
-
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(y=gate_e1_list, name="Expert1"))
-    fig3.add_trace(go.Scatter(y=gate_e2_list, name="Expert2"))
-    fig3.add_trace(go.Scatter(y=gate_e3_list, name="Expert3"))
-    fig3.add_trace(go.Scatter(y=gate_e4_list, name="Expert4"))
-    fig3.update_layout(title="Gate Weights (Mean, temperature-adjusted)", xaxis_title="Epoch", yaxis_title="Weight")
-    fig3.write_html(f"{save_dir}/plots/gate_weights.html")
-
-    fig4 = go.Figure()
-    fig4.add_trace(go.Scatter(y=train_mae_list, name="Train MAE"))
-    fig4.add_trace(go.Scatter(y=val_mae_list, name="Val MAE"))
-    fig4.update_layout(title="MAE Curve", xaxis_title="Epoch", yaxis_title="MAE")
-    fig4.write_html(f"{save_dir}/plots/mae_curve.html")
-
-    fig5 = go.Figure()
-    fig5.add_trace(go.Scatter(y=train_mse_metric_list, name="Train MSE"))
-    fig5.add_trace(go.Scatter(y=val_mse_metric_list, name="Val MSE"))
-    fig5.update_layout(title="MSE Curve", xaxis_title="Epoch", yaxis_title="MSE")
-    fig5.write_html(f"{save_dir}/plots/mse_curve.html")
-
-    fig6 = go.Figure()
-    fig6.add_trace(go.Scatter(y=train_r2_list, name="Train R2"))
-    fig6.add_trace(go.Scatter(y=val_r2_list, name="Val R2"))
-    fig6.update_layout(title="R2 Curve", xaxis_title="Epoch", yaxis_title="R2")
-    fig6.write_html(f"{save_dir}/plots/r2_curve.html")
-
-    df = pd.DataFrame({
-        "TrainLoss": train_losses,
-        "ValLoss": val_losses,
-        "DataLoss": mse_list,
-        "NonNeg": nonneg_list,
-        "Smooth": smooth_list,
-        "Entropy": entropy_list,
-        "Train_MAE": train_mae_list,
-        "Val_MAE": val_mae_list,
-        "Train_MSE_metric": train_mse_metric_list,
-        "Val_MSE_metric": val_mse_metric_list,
-        "Train_R2": train_r2_list,
-        "Val_R2": val_r2_list,
-        "Gate_Expert1": gate_e1_list,
-        "Gate_Expert2": gate_e2_list,
-        "Gate_Expert3": gate_e3_list,
-        "Gate_Expert4": gate_e4_list,
-    })
-    df.to_csv(f"{save_dir}/plots/training_metrics.csv", index=False)
-    logger.info(f"Training complete. Artifacts written to {save_dir}")
+    return summary

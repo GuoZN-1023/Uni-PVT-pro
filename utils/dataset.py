@@ -321,24 +321,37 @@ class ZDataset(Dataset):
         except Exception:
             target_candidates_raw = list(chosen_targets)
 
-        # 数值化：只保留需要的列（X + chosen_targets + expert_col）
+        # ---- 需要的列（X + targets + expert_col）----
         needed_cols = list(feature_cols_raw) + list(chosen_targets) + [expert_col]
-        df = df_raw.loc[:, needed_cols].copy()
 
-        # 强制转换为数值（把字符串等转成 NaN），再统一 dropna
+        # 1) 训练/预测所用 df：仅包含 needed_cols，并且确保这些列都是可数值化的
+        df_needed = df_raw.loc[:, needed_cols].copy()
         for c in needed_cols:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df_needed[c] = pd.to_numeric(df_needed[c], errors="coerce")
 
-        before = len(df)
-        df = df.dropna(axis=0, how="any").reset_index(drop=True)
-        dropped = before - len(df)
+        before = len(df_needed)
+        df_needed = df_needed.dropna(axis=0, how="any")
+        dropped = before - len(df_needed)
         if dropped > 0:
             # 保持安静，但给出最基本的提示
             print(f"[ZDataset] Dropped {dropped} rows due to NaNs after numeric conversion.")
 
         # subset（可选）
         subset_cfg = cfg.get("subset", None)
-        df = apply_subset(df, subset_cfg=subset_cfg, expert_col=expert_col).reset_index(drop=True)
+        df_needed = apply_subset(df_needed, subset_cfg=subset_cfg, expert_col=expert_col)
+
+        # 2) 输出用 num_df：尽量保持旧项目行为（把“状态变量”一并带进 test_predictions.csv）
+        # - 取 CSV 中原本就为数值的列
+        # - 再把 needed_cols 强制数值化写回，确保这些列一定包含在输出里
+        num_df = df_raw.select_dtypes(include=[np.number]).copy()
+        for c in needed_cols:
+            num_df[c] = pd.to_numeric(df_raw[c], errors="coerce")
+
+        keep_idx = df_needed.index
+        self.num_df = num_df.loc[keep_idx].reset_index(drop=True)
+
+        # 最终用于建模的数据 df（只含 needed_cols），对齐 num_df 的行顺序
+        df = df_needed.reset_index(drop=True)
 
         # expert id
         if expert_col not in df.columns:
@@ -351,6 +364,11 @@ class ZDataset(Dataset):
         self.feature_cols = list(feature_cols_raw)
         self.all_target_cols = list(target_candidates_raw)
         self.target_cols = list(chosen_targets)
+
+        # 输出用 DataFrame（用于 predict.py 导出）
+        # - self.num_df: 尽量保留 CSV 中所有可数值化列（与你旧版更一致，便于回溯与分析）
+        # - self.feature_df: 仅包含 feature_cols（方便 SHAP / 只看输入特征时使用）
+        self.feature_df = df[self.feature_cols].copy()
 
         # X / y
         X = df[self.feature_cols].values.astype(np.float32)
@@ -368,6 +386,10 @@ class ZDataset(Dataset):
             scaler = joblib.load(self.scaler_path)
             Xs = scaler.transform(X)
 
+
+        # store scaler params for PINN derivative unit conversion
+        self.scaler_mean = np.asarray(getattr(scaler, 'mean_', np.zeros(X.shape[1])), dtype=np.float32)
+        self.scaler_scale = np.asarray(getattr(scaler, 'scale_', np.ones(X.shape[1])), dtype=np.float32)
         self.X = Xs.astype(np.float32)
         self.y = y
         self.input_dim = int(self.X.shape[1])
@@ -390,8 +412,17 @@ def get_dataloaders(cfg: dict):
     重要：input_dim/output_dim 由数据自动推断，
     train.py 会在拿到 dataloaders 后把它写回 cfg['model']。
     """
-    data_path = cfg["paths"]["data"]
-    scaler_path = cfg["paths"]["scaler"]
+    paths = cfg.get("paths", {}) or {}
+    data_path = paths.get("data", None)
+    scaler_path = paths.get("scaler", None)
+    if not data_path:
+        raise ValueError("Missing paths.data in config. Please set paths.data to your CSV file path.")
+    if not scaler_path:
+        # default to save_dir/scaler.pkl if not provided
+        save_dir = paths.get("save_dir", "results/latest")
+        scaler_path = os.path.join(save_dir, "scaler.pkl")
+        paths["scaler"] = scaler_path
+        cfg["paths"] = paths
 
     set_seed(42)
 
@@ -412,7 +443,7 @@ def get_dataloaders(cfg: dict):
         full_dataset, [n_train, n_val, n_test], generator=g
     )
 
-    bs = int(cfg["training"]["batch_size"])
+    bs = int((cfg.get("training", {}) or {}).get("batch_size", 256))
     return {
         "train": DataLoader(train_set, batch_size=bs, shuffle=True),
         "val": DataLoader(val_set, batch_size=bs, shuffle=False),
