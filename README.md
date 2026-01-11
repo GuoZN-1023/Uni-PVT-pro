@@ -1,4 +1,4 @@
-# Uni-PVT-pro: Physics-Informed Mixture-of-Experts for Universal Fluid Thermodynamic Property Prediction
+# Uni-PVT-pro: Physics-Informed--Mixture-of-Experts for Universal Fluid Thermodynamic Property Prediction
 
 **Uni-PVT-pro** is an advanced deep learning framework designed to predict thermodynamic properties (such as Compressibility Factor , Fugacity Coefficient , Enthalpy , and Entropy ) from PVT data.
 
