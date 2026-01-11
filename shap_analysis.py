@@ -92,6 +92,9 @@ def main():
     os.makedirs(shap_dir, exist_ok=True)
 
     logger = get_file_logger(os.path.join(shap_dir, "shap_analysis.log"), name="shap")
+    shap_cfg = (cfg.get("shap", {}) or {})
+    save_csv = bool(shap_cfg.get("save_csv", False))
+    logger.info(f"SHAP save_csv={save_csv}")
     logger.info(f"Device: {device}")
     logger.info(f"Config: {os.path.abspath(args.config)}")
 
@@ -225,22 +228,28 @@ def main():
         df_bar = (
             pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs})
             .sort_values("mean_abs_shap", ascending=False)
-        )
-        bar_csv = os.path.join(shap_dir, f"shap_bar__{safe}.csv")
-        df_bar.to_csv(bar_csv, index=False)
+        )        
+        bar_csv = None
+        shap_csv = None
+        if save_csv:
+            # mean(|shap|) bar csv
+            bar_csv = os.path.join(shap_dir, f"shap_bar__{safe}.csv")
+            df_bar.to_csv(bar_csv, index=False)
 
-        # shap values csv
-        feat_df = pd.DataFrame(X_explain_np, columns=[f"feat::{c}" for c in feature_names])
-        shap_df = pd.DataFrame(shap_values_arr, columns=[f"shap::{c}" for c in feature_names])
-        out_df = pd.concat([feat_df, shap_df], axis=1)
-        out_df["target"] = str(tgt)
-        out_df["explainer"] = used
-        shap_csv = os.path.join(shap_dir, f"shap_values__{safe}.csv")
-        out_df.to_csv(shap_csv, index=False)
+            # shap values csv
+            feat_df = pd.DataFrame(X_explain_np, columns=[f"feat::{c}" for c in feature_names])
+            shap_df = pd.DataFrame(shap_values_arr, columns=[f"shap::{c}" for c in feature_names])
+            out_df = pd.concat([feat_df, shap_df], axis=1)
+            out_df["target"] = str(tgt)
+            out_df["explainer"] = used
+            shap_csv = os.path.join(shap_dir, f"shap_values__{safe}.csv")
+            out_df.to_csv(shap_csv, index=False)
 
         artifacts["summary_png"][str(tgt)] = os.path.abspath(summary_png)
-        artifacts["bar_csv"][str(tgt)] = os.path.abspath(bar_csv)
-        artifacts["shap_csv"][str(tgt)] = os.path.abspath(shap_csv)
+        if save_csv and bar_csv is not None:
+            artifacts.setdefault("bar_csv", {})[str(tgt)] = os.path.abspath(bar_csv)
+        if save_csv and shap_csv is not None:
+            artifacts.setdefault("shap_csv", {})[str(tgt)] = os.path.abspath(shap_csv)
 
     # write shap artifacts json
     with open(os.path.join(shap_dir, "shap_artifacts.json"), "w", encoding="utf-8") as f:

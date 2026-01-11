@@ -89,6 +89,26 @@ def _infer_targets_from_pred_csv(pred_csv_path: str):
         return []
 
 
+def _cleanup_extra_csv(exp_dir: str, keep_abs_paths: set[str], runall_log: str):
+    """Delete all .csv under exp_dir except the ones in keep_abs_paths.
+    Keep plots/html/images/logs/etc. This is to keep outputs tidy.
+    """
+    removed = 0
+    for root, _, files in os.walk(exp_dir):
+        for fn in files:
+            if not fn.lower().endswith(".csv"):
+                continue
+            p = os.path.abspath(os.path.join(root, fn))
+            if p in keep_abs_paths:
+                continue
+            try:
+                os.remove(p)
+                removed += 1
+            except Exception:
+                pass
+    _append(runall_log, f"[run_all] CSV cleanup removed {removed} extra csv files.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/config.yaml")
@@ -136,7 +156,7 @@ def main():
             stdout_path=train_out, stderr_path=train_err, runall_log=runall_log)
 
     _append(runall_log, "\n===== STAGE: PREDICT =====")
-    run_cmd([python_exec, "predict.py", "--config", exp_config_path],
+    run_cmd([python_exec, "export_results.py", "--config", exp_config_path, "--outdir", os.path.join(exp_dir, "exports")],
             stdout_path=pred_out, stderr_path=pred_err, runall_log=runall_log)
 
     shap_cfg = cfg.get("shap", {})
@@ -163,7 +183,7 @@ def main():
 
     ptviz_html_map = {}
     if ptviz_enabled:
-        pred_csv = os.path.join(exp_dir, "eval", "test_predictions.csv")
+        pred_csv = os.path.join(exp_dir, "exports", "finetune_test_predictions.csv")
         if os.path.exists(pred_csv):
             targets = _infer_targets_from_pred_csv(pred_csv)
             if targets:
@@ -228,6 +248,22 @@ def main():
             "pt_viz_stderr": os.path.abspath(ptviz_err),
         },
     })
+
+    
+    # Keep only the 6 export CSVs; remove any other CSV artifacts created by submodules.
+    exports_dir = os.path.join(exp_dir, "exports")
+    keep_names = [
+        "pretrain_best_predictions.csv",
+        "pretrain_best_metrics.csv",
+        "gate_test_predictions.csv",
+        "gate_test_metrics.csv",
+        "finetune_test_predictions.csv",
+        "finetune_test_metrics.csv",
+    ]
+    keep_abs = set()
+    for name in keep_names:
+        keep_abs.add(os.path.abspath(os.path.join(exports_dir, name)))
+    _cleanup_extra_csv(exp_dir, keep_abs_paths=keep_abs, runall_log=runall_log)
 
     summary.setdefault("PtVizArtifacts", {})
     summary["PtVizArtifacts"].update({

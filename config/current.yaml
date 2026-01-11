@@ -1,7 +1,19 @@
+data:
+  limit_rows: null
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  split:
+    seed: 42
+    shuffle: true
+    test_ratio: 0.1
+    train_ratio: 0.8
+    val_ratio: 0.1
 expert_col: 'no'
 experts:
   critical:
-    activation: tanh
+    activation: gelu
     dropout: 0.0
     hidden_layers:
     - 512
@@ -31,6 +43,22 @@ experts:
     - 256
     - 128
     - 64
+exports:
+  cleanup_allowlist_dirs:
+  - exports
+  cleanup_other_csv: true
+  enabled: true
+  files:
+    finetune_test_metrics: finetune_test_metrics.csv
+    finetune_test_predictions: finetune_test_predictions.csv
+    gate_test_metrics: gate_test_metrics.csv
+    gate_test_predictions: gate_test_predictions.csv
+    pretrain_best_metrics: pretrain_best_metrics.csv
+    pretrain_best_predictions: pretrain_best_predictions.csv
+  outdir_name: exports
+  predictions_keep:
+    keep_expert_col: true
+    keep_features: true
 feature_cols:
 - T_r (-)
 - p_r (-)
@@ -48,6 +76,7 @@ gate:
   - 64
 loss:
   extreme_alpha: 4.0
+  huber_delta: 1.0
   lambda_entropy: -0.01
   lambda_extreme: 1.0
   lambda_nonneg: 3.08e-05
@@ -63,6 +92,7 @@ loss:
   supervised: mse
   target_normalize:
     enabled: true
+    eps: 1.0e-12
     mode: per_target_std
 model:
   input_dim: 8
@@ -80,10 +110,11 @@ optuna:
   study_name: uni_pvt_mo
 paths:
   data: data/Water.csv
-  save_dir: results/2026-01-11_16-53-30
-  scaler: results/2026-01-11_16-53-30/scaler.pkl
+  save_dir: results/2026-01-11_20-16-08
+  scaler: results/2026-01-11_20-16-08/scaler.pkl
 pinn:
   R: 8.31446261815324
+  compute_every_steps: 2
   enabled: true
   input_mode: reduced
   lambda_H: 0.05
@@ -94,12 +125,26 @@ pinn:
   schedule:
     apply_in_finetune: true
     apply_in_gate_train: true
-    apply_in_pretrain: false
+    apply_in_pretrain: true
   t_feature: T_r (-)
   z_name: Z (-)
+pt_viz:
+  allow_fail: true
+  diff_mode: pred_minus_true
+  enabled: true
+  per_target: true
+runtime:
+  amp:
+    enabled: true
+  compile:
+    enabled: false
+  device: auto
+  tf32:
+    enabled: true
 shap:
   enabled: true
   max_samples: 2000
+  save_csv: false
 targets:
 - Z (-)
 training:
@@ -107,11 +152,16 @@ training:
   early_stopping:
     enabled: true
     min_delta: 0.0
+    monitor: val_loss
     patience: 20
+  eval:
+    eval_every_epochs: 1
+    log_every_steps: 50
   finetune:
     enabled: true
     epochs: 80
     learning_rate: 0.0007
+    min_lr: 5.0e-06
     unfreeze:
     - gas
     - liquid
@@ -122,7 +172,28 @@ training:
     enabled: true
     end: 0.8
     start: 1.5
-  learning_rate: 0.0017
+  gradient_clip_norm: 0.0
+  learning_rate: 0.0005
+  lr_scheduler:
+    enabled: true
+    gamma: 0.5
+    min_lr: 1.0e-05
+    name: cosine
+    plateau:
+      factor: 0.5
+      min_lr: 1.0e-06
+      mode: min
+      patience: 8
+      threshold: 0.0
+    step_size: 20
+    warmup_epochs: 5
+    warmup_start_factor: 0.2
+  optimizer:
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-08
+    name: adamw
   pretrain_epochs: 30
   seed: 42
   weight_decay: 0.0

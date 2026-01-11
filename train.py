@@ -127,7 +127,8 @@ def main():
     criterion = PhysicsLoss(cfg)
 
     lr = float(cfg["training"]["learning_rate"])
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    weight_decay = float(cfg["training"].get("weight_decay", 0.0))
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     train_model(model, dataloaders, criterion, optimizer, cfg, device, logger)
 

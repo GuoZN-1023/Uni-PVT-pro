@@ -1,4 +1,3 @@
-
 # utils/trainer.py
 from __future__ import annotations
 import os
@@ -7,6 +6,16 @@ import torch
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
+    StepLR,
+    ExponentialLR,
+    ReduceLROnPlateau,
+    LinearLR,
+    SequentialLR,
+)
 
 from .thermo_pinn import ThermoPinnLoss
 
@@ -98,6 +107,130 @@ def _fused_from_experts(w: torch.Tensor, expert_outputs: torch.Tensor) -> torch.
     return torch.sum(w.unsqueeze(-1) * expert_outputs, dim=1)
 
 
+def _get_scheduler_cfg(training_cfg: dict, stage: str) -> dict:
+    """Return scheduler config for a given stage.
+
+    Supported keys (either under `training.scheduler` or `training.lr_scheduler`):
+      enabled: bool
+      name: cosine | cosine_restart | step | exp | plateau | none
+      min_lr: float
+      warmup_epochs: int
+      warmup_start_factor: float
+      step_size: int
+      gamma: float
+      patience: int
+      factor: float
+      restart_T0: int
+      restart_Tmult: int
+
+    You may also provide per-stage overrides:
+      scheduler:
+        enabled: true
+        name: cosine
+        stage1: { ... }
+        stage2: { ... }
+        finetune: { ... }
+    """
+    sched = training_cfg.get("lr_scheduler", None)
+    if sched is None:
+        sched = training_cfg.get("scheduler", {})
+    if sched is None:
+        sched = {}
+    if isinstance(sched, str):
+        sched = {"enabled": True, "name": sched}
+    if not isinstance(sched, dict):
+        return {}
+
+    # per-stage override
+    per_stage = sched.get(stage, None)
+    if isinstance(per_stage, dict):
+        merged = dict(sched)
+        merged.update(per_stage)
+        return merged
+    return sched
+
+
+def _build_epoch_scheduler(optimizer, sched_cfg: dict, *, stage_epochs: int, base_lr: float):
+    """Build an epoch-stepped LR scheduler. Returns (scheduler, scheduler_kind).
+
+    scheduler_kind is one of: 'epoch', 'plateau', or None.
+    """
+    if not sched_cfg or not bool(sched_cfg.get("enabled", False)):
+        return None, None
+
+    name = str(sched_cfg.get("name", "cosine")).lower()
+    if name in ("none", "off", "disable", "disabled"):
+        return None, None
+
+    warmup_epochs = int(sched_cfg.get("warmup_epochs", 0) or 0)
+    warmup_epochs = max(warmup_epochs, 0)
+    warmup_start_factor = float(sched_cfg.get("warmup_start_factor", 0.1))
+    warmup_start_factor = min(max(warmup_start_factor, 1e-4), 1.0)
+
+    min_lr = float(sched_cfg.get("min_lr", base_lr * 0.1))
+    min_lr = max(min_lr, 0.0)
+
+    main_epochs = max(int(stage_epochs) - warmup_epochs, 1)
+
+    if name == "cosine":
+        main = CosineAnnealingLR(optimizer, T_max=main_epochs, eta_min=min_lr)
+        if warmup_epochs > 0:
+            warm = LinearLR(optimizer, start_factor=warmup_start_factor, total_iters=warmup_epochs)
+            return SequentialLR(optimizer, schedulers=[warm, main], milestones=[warmup_epochs]), "epoch"
+        return main, "epoch"
+
+    if name in ("cosine_restart", "warm_restarts", "cosine_warm_restarts"):
+        T0 = int(sched_cfg.get("restart_T0", max(main_epochs // 2, 1)))
+        Tmult = int(sched_cfg.get("restart_Tmult", 2))
+        main = CosineAnnealingWarmRestarts(optimizer, T_0=max(T0, 1), T_mult=max(Tmult, 1), eta_min=min_lr)
+        if warmup_epochs > 0:
+            warm = LinearLR(optimizer, start_factor=warmup_start_factor, total_iters=warmup_epochs)
+            return SequentialLR(optimizer, schedulers=[warm, main], milestones=[warmup_epochs]), "epoch"
+        return main, "epoch"
+
+    if name == "step":
+        step_size = int(sched_cfg.get("step_size", max(main_epochs // 3, 1)))
+        gamma = float(sched_cfg.get("gamma", 0.5))
+        main = StepLR(optimizer, step_size=max(step_size, 1), gamma=gamma)
+        if warmup_epochs > 0:
+            warm = LinearLR(optimizer, start_factor=warmup_start_factor, total_iters=warmup_epochs)
+            return SequentialLR(optimizer, schedulers=[warm, main], milestones=[warmup_epochs]), "epoch"
+        return main, "epoch"
+
+    if name in ("exp", "exponential"):
+        gamma = float(sched_cfg.get("gamma", 0.98))
+        main = ExponentialLR(optimizer, gamma=gamma)
+        if warmup_epochs > 0:
+            warm = LinearLR(optimizer, start_factor=warmup_start_factor, total_iters=warmup_epochs)
+            return SequentialLR(optimizer, schedulers=[warm, main], milestones=[warmup_epochs]), "epoch"
+        return main, "epoch"
+
+    if name in ("plateau", "reduce_on_plateau"):
+        factor = float(sched_cfg.get("factor", 0.5))
+        patience = int(sched_cfg.get("patience", 10))
+        min_lr_plateau = float(sched_cfg.get("min_lr", min_lr))
+        main = ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=factor,
+            patience=max(patience, 0),
+            threshold=float(sched_cfg.get("threshold", 0.0)),
+            threshold_mode=str(sched_cfg.get("threshold_mode", "rel")),
+            min_lr=max(min_lr_plateau, 0.0),
+            verbose=False,
+        )
+        # Warmup with plateau is unusual; we simply ignore warmup here.
+        return main, "plateau"
+
+    # fallback: no scheduler
+    return None, None
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float):
+    for pg in optimizer.param_groups:
+        pg["lr"] = float(lr)
+
+
 @torch.no_grad()
 def _eval_loss_and_metrics(model, loader, criterion, device, *, target_cols: list[str] | None):
     model.eval()
@@ -187,6 +320,10 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
             finetune_epochs = 0
     finetune_epochs = int(finetune_epochs)
     base_lr = float(training.get("learning_rate", 1e-3))
+    stage1_lr = float(training.get("stage1_lr", base_lr))
+    stage2_lr = float(training.get("stage2_lr", base_lr))
+    finetune_lr = float((training.get("finetune", {}) or {}).get("learning_rate", base_lr))
+    weight_decay = float(training.get("weight_decay", 0.0))
     clip_grad = float(training.get("clip_grad_norm", 5.0))
     tau_stage2 = float(training.get("temperature", 1.0))
 
@@ -194,17 +331,87 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
     gate_params, expert_params = _gate_and_expert_params(model)
 
     # Stage-specific optimizers
-    opt_experts = torch.optim.Adam(expert_params, lr=base_lr) if expert_params else None
-    opt_gates = torch.optim.Adam(gate_params, lr=base_lr) if gate_params else None
+    opt_experts = torch.optim.Adam(expert_params, lr=stage1_lr, weight_decay=weight_decay) if expert_params else None
+    opt_gates = torch.optim.Adam(gate_params, lr=stage2_lr, weight_decay=weight_decay) if gate_params else None
     opt_joint = optimizer  # keep your external optimizer for finetune
 
-    best_val = float("inf")
-    best_path = os.path.join(ckpt_dir, "best_model.pt")
+    # --- LR schedulers (optional) ---
+    # Configure via training.lr_scheduler or training.scheduler.
+    # Per-stage overrides: scheduler.stage1 / scheduler.stage2 / scheduler.finetune
+    sched_stage1, sched_stage1_kind = _build_epoch_scheduler(
+        opt_experts,
+        _get_scheduler_cfg(training, "stage1"),
+        stage_epochs=pretrain_epochs,
+        base_lr=stage1_lr,
+    ) if opt_experts is not None else (None, None)
+
+    sched_stage2, sched_stage2_kind = _build_epoch_scheduler(
+        opt_gates,
+        _get_scheduler_cfg(training, "stage2"),
+        stage_epochs=stage2_epochs,
+        base_lr=stage2_lr,
+    ) if opt_gates is not None else (None, None)
+
+    # finetune scheduler is built later (after we set finetune lr on the joint optimizer)
+    sched_finetune = None
+    sched_finetune_kind = None
+
+    # ---------------- stage-specific best checkpoints ----------------
+    # Stage1: best checkpoint per expert (hard routing)
+    best_stage1 = {eid: float('inf') for eid in (1,2,3,4)}
+    best_stage1_paths = {eid: os.path.join(ckpt_dir, f'best_stage1_expert{eid}.pt') for eid in (1,2,3,4)}
+
+    # Stage2: best gate-only checkpoint (experts frozen)
+    best_stage2_val = float('inf')
+    best_stage2_path = os.path.join(ckpt_dir, 'best_stage2.pt')
+
+    # Finetune: best joint checkpoint
+    best_finetune_val = float('inf')
+    best_finetune_path = os.path.join(ckpt_dir, 'best_finetune.pt')
+
+    # Backward compatibility: keep a canonical best_model.pt
+    best_model_path = os.path.join(ckpt_dir, 'best_model.pt')
 
     def _save(tag: str):
         p = os.path.join(ckpt_dir, f"{tag}.pt")
         torch.save(model.state_dict(), p)
         return p
+
+
+    @torch.no_grad()
+    def _eval_stage1_expert_losses():
+        model.eval()
+        totals = {eid: 0.0 for eid in (1,2,3,4)}
+        counts = {eid: 0 for eid in (1,2,3,4)}
+        for x, y, expert_id in val_loader:
+            x = x.to(device)
+            y = y.to(device)
+            expert_id = expert_id.to(device).view(-1)
+            out = model(x)
+            for eid in (1,2,3,4):
+                mask = (expert_id == eid)
+                if not torch.any(mask):
+                    continue
+                if out['aux']['cascade']:
+                    z_idx = int(out['aux']['z_out_idx'])
+                    other_inds = list(out['aux']['other_indices'])
+                    exps_z = out['expert_outputs']['z']
+                    pred_z = exps_z[mask, eid-1, :]
+                    y_z = y[mask, z_idx:z_idx+1]
+                    loss_z, *_ = criterion(pred_z, y_z, expert_id=expert_id[mask], gate_w=None, target_indices=[z_idx])
+                    exps_p = out['expert_outputs']['props']
+                    pred_p = exps_p[mask, eid-1, :]
+                    y_p = y[mask][:, other_inds]
+                    loss_p, *_ = criterion(pred_p, y_p, expert_id=expert_id[mask], gate_w=None, target_indices=list(other_inds))
+                    loss = loss_z + loss_p
+                else:
+                    exps = out['expert_outputs']['all']
+                    pred = exps[mask, eid-1, :]
+                    loss, *_ = criterion(pred, y[mask], expert_id=expert_id[mask], gate_w=None)
+                n = int(mask.sum().item())
+                totals[eid] += float(loss.item()) * n
+                counts[eid] += n
+        return {eid: (totals[eid]/counts[eid] if counts[eid] > 0 else float('inf')) for eid in (1,2,3,4)}
 
     # ---------------- Stage 1: Pretrain experts (hard routing by expert_id) ----------------
     if pretrain_epochs > 0 and opt_experts is not None:
@@ -256,8 +463,21 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 n_batches += 1
 
             val_loss, val_metrics = _eval_loss_and_metrics(model, val_loader, criterion, device, target_cols=target_cols)
-            logger.info(f"[Stage1][{epoch+1}/{pretrain_epochs}] train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
+            lr_now = float(opt_experts.param_groups[0]['lr'])
+            logger.info(f"[Stage1][{epoch+1}/{pretrain_epochs}] lr={lr_now:.6g} train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
                         f"val_R2_mean={val_metrics['mean']['R2']:.4f}")
+            expert_val_losses = _eval_stage1_expert_losses()
+            for _eid, _loss in expert_val_losses.items():
+                if _loss < best_stage1[_eid]:
+                    best_stage1[_eid] = float(_loss)
+                    torch.save(model.state_dict(), best_stage1_paths[_eid])
+
+            # step LR scheduler (if enabled)
+            if sched_stage1 is not None:
+                if sched_stage1_kind == 'plateau':
+                    sched_stage1.step(val_loss)
+                else:
+                    sched_stage1.step()
 
     # ---------------- Stage 2: Train gate(s) ----------------
     if stage2_epochs > 0 and opt_gates is not None:
@@ -319,16 +539,33 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 n_batches += 1
 
             val_loss, val_metrics = _eval_loss_and_metrics(model, val_loader, criterion, device, target_cols=target_cols)
-            logger.info(f"[Stage2][{epoch+1}/{stage2_epochs}] train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
+            lr_now = float(opt_gates.param_groups[0]['lr'])
+            logger.info(f"[Stage2][{epoch+1}/{stage2_epochs}] lr={lr_now:.6g} train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
                         f"val_R2_mean={val_metrics['mean']['R2']:.4f}")
 
-            if val_loss < best_val:
-                best_val = val_loss
-                torch.save(model.state_dict(), best_path)
+            if val_loss < best_stage2_val:
+                best_stage2_val = val_loss
+                torch.save(model.state_dict(), best_stage2_path)
+
+            # step LR scheduler (if enabled)
+            if sched_stage2 is not None:
+                if sched_stage2_kind == 'plateau':
+                    sched_stage2.step(val_loss)
+                else:
+                    sched_stage2.step()
 
     # ---------------- Finetune: Joint training ----------------
     if finetune_epochs > 0:
         logger.info(f"=== Finetune: Joint training ({finetune_epochs} epochs) ===")
+        # Apply the finetune LR (config: training.finetune.learning_rate) if provided.
+        if opt_joint is not None:
+            _set_optimizer_lr(opt_joint, finetune_lr)
+            sched_finetune, sched_finetune_kind = _build_epoch_scheduler(
+                opt_joint,
+                _get_scheduler_cfg(training, "finetune"),
+                stage_epochs=finetune_epochs,
+                base_lr=finetune_lr,
+            )
         for p in gate_params + expert_params:
             p.requires_grad = True
 
@@ -365,24 +602,47 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 n_batches += 1
 
             val_loss, val_metrics = _eval_loss_and_metrics(model, val_loader, criterion, device, target_cols=target_cols)
-            logger.info(f"[Finetune][{epoch+1}/{finetune_epochs}] train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
+            lr_now = float(opt_joint.param_groups[0]['lr']) if opt_joint is not None else float('nan')
+            logger.info(f"[Finetune][{epoch+1}/{finetune_epochs}] lr={lr_now:.6g} train_loss={running/max(n_batches,1):.6f} val_loss={val_loss:.6f} "
                         f"val_R2_mean={val_metrics['mean']['R2']:.4f}")
 
-            if val_loss < best_val:
-                best_val = val_loss
-                torch.save(model.state_dict(), best_path)
+            if val_loss < best_finetune_val:
+                best_finetune_val = val_loss
+                torch.save(model.state_dict(), best_finetune_path)
+
+            # step LR scheduler (if enabled)
+            if sched_finetune is not None:
+                if sched_finetune_kind == 'plateau':
+                    sched_finetune.step(val_loss)
+                else:
+                    sched_finetune.step()
 
     # always save last
-    _save("last_model")
-    if os.path.exists(best_path):
-        logger.info(f"Best model saved: {best_path} (val_loss={best_val:.6f})")
+    last_path = _save('last_model')
+
+    canonical_src = None
+    canonical_val = None
+    if finetune_epochs > 0 and os.path.exists(best_finetune_path):
+        canonical_src = best_finetune_path
+        canonical_val = best_finetune_val
+    elif stage2_epochs > 0 and os.path.exists(best_stage2_path):
+        canonical_src = best_stage2_path
+        canonical_val = best_stage2_val
+
+    if canonical_src is not None:
+        try:
+            import shutil
+            shutil.copyfile(canonical_src, best_model_path)
+        except Exception:
+            pass
+        logger.info(f"Best model saved: {best_model_path} (src={os.path.basename(canonical_src)}, val_loss={float(canonical_val):.6f})")
     else:
-        logger.info("No best model tracked; using last_model.pt")
+        logger.info(f"No Stage2/Finetune best tracked; using last model: {last_path}")
 
     # Export a small training summary
     summary = {
-        "best_val_loss": float(best_val),
-        "best_model_path": best_path if os.path.exists(best_path) else None,
+        "best_val_loss": float(best_finetune_val if (finetune_epochs>0 and not math.isinf(best_finetune_val)) else (best_stage2_val if (stage2_epochs>0 and not math.isinf(best_stage2_val)) else float("inf"))),
+        "best_model_path": best_model_path if os.path.exists(best_model_path) else None,
         "target_cols": target_cols,
         "feature_cols": feature_cols,
         "pinn_enabled": bool(pinn_loss.enabled),
