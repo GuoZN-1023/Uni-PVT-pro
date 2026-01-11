@@ -150,6 +150,8 @@ def main():
     shap_err = os.path.join(logs_dir, "shap.stderr.log")
     ptviz_out = os.path.join(logs_dir, "pt_viz.stdout.log")
     ptviz_err = os.path.join(logs_dir, "pt_viz.stderr.log")
+    ptcmp_out = os.path.join(logs_dir, "pt_predtrue_compare.stdout.log")
+    ptcmp_err = os.path.join(logs_dir, "pt_predtrue_compare.stderr.log")
 
     _append(runall_log, "\n===== STAGE: TRAIN =====")
     run_cmd([python_exec, "train.py", "--config", exp_config_path],
@@ -182,6 +184,7 @@ def main():
     _append(runall_log, f"\n===== STAGE: PT_VIZ (enabled={ptviz_enabled}, allow_fail={ptviz_allow_fail}, diff_mode={ptviz_diff_mode}) =====")
 
     ptviz_html_map = {}
+    ptcmp_html_map = {}
     if ptviz_enabled:
         pred_csv = os.path.join(exp_dir, "exports", "finetune_test_predictions.csv")
         if os.path.exists(pred_csv):
@@ -201,6 +204,21 @@ def main():
                         html = os.path.join(outdir, "pt_viz_dashboard.html")
                         if os.path.exists(html):
                             ptviz_html_map[tgt] = os.path.abspath(html)
+
+                    # --- Pred-vs-True Compare (Pretrain/Gate/Finetune in one HTML) ---
+                    # Use the 6 clean exports as inputs; never writes extra CSV.
+                    exports_dir = os.path.join(exp_dir, "exports")
+                    cmp_html = os.path.join(exp_dir, "pt_viz", f"pred_true_compare__{slug}.html")
+                    expert_col = str(cfg.get("expert_col", "no"))
+                    rc2 = run_cmd(
+                        [python_exec, "pt_predtrue_compare.py", "--exports_dir", exports_dir, "--out_html", cmp_html, "--target", tgt, "--expert_col", expert_col],
+                        stdout_path=ptcmp_out,
+                        stderr_path=ptcmp_err,
+                        runall_log=runall_log,
+                        allow_fail=True,
+                    )
+                    if rc2 == 0 and os.path.exists(cmp_html):
+                        ptcmp_html_map[tgt] = os.path.abspath(cmp_html)
             else:
                 # 单目标兼容：predict.py 会写 y_true/y_pred
                 outdir = os.path.join(exp_dir, "pt_viz")
@@ -215,6 +233,20 @@ def main():
                     html = os.path.join(outdir, "pt_viz_dashboard.html")
                     if os.path.exists(html):
                         ptviz_html_map["__single__"] = os.path.abspath(html)
+
+                # single-target compare html
+                exports_dir = os.path.join(exp_dir, "exports")
+                cmp_html = os.path.join(exp_dir, "pt_viz", "pred_true_compare__single.html")
+                expert_col = str(cfg.get("expert_col", "no"))
+                rc2 = run_cmd(
+                    [python_exec, "pt_predtrue_compare.py", "--exports_dir", exports_dir, "--out_html", cmp_html, "--expert_col", expert_col],
+                    stdout_path=ptcmp_out,
+                    stderr_path=ptcmp_err,
+                    runall_log=runall_log,
+                    allow_fail=True,
+                )
+                if rc2 == 0 and os.path.exists(cmp_html):
+                    ptcmp_html_map["__single__"] = os.path.abspath(cmp_html)
         else:
             _append(runall_log, f"[run_all] PT_VIZ skipped: prediction csv not found: {pred_csv}")
     else:
@@ -246,6 +278,8 @@ def main():
             "shap_stderr": os.path.abspath(shap_err),
             "pt_viz_stdout": os.path.abspath(ptviz_out),
             "pt_viz_stderr": os.path.abspath(ptviz_err),
+            "pt_predtrue_compare_stdout": os.path.abspath(ptcmp_out),
+            "pt_predtrue_compare_stderr": os.path.abspath(ptcmp_err),
         },
     })
 
@@ -268,6 +302,7 @@ def main():
     summary.setdefault("PtVizArtifacts", {})
     summary["PtVizArtifacts"].update({
         "dashboards": ptviz_html_map,
+        "pred_true_compare": ptcmp_html_map,
     })
 
     with open(summary_path, "w", encoding="utf-8") as f:

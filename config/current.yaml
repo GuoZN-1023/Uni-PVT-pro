@@ -110,8 +110,8 @@ optuna:
   study_name: uni_pvt_mo
 paths:
   data: data/Water.csv
-  save_dir: results/2026-01-11_20-16-08
-  scaler: results/2026-01-11_20-16-08/scaler.pkl
+  save_dir: results/2026-01-11_23-24-57
+  scaler: results/2026-01-11_23-24-57/scaler.pkl
 pinn:
   R: 8.31446261815324
   compute_every_steps: 2
