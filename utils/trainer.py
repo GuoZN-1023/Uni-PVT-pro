@@ -239,8 +239,8 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                     exps_p = out["expert_outputs"]["props"]  # (B,4,To)
                     sel_p = exps_p[torch.arange(x.shape[0], device=device), torch.clamp(expert_id-1,0,3)]
 
-                    loss_z, *_ = criterion(sel_z, y_z, expert_id=expert_id, gate_w=None)
-                    loss_p, *_ = criterion(sel_p, y_p, expert_id=expert_id, gate_w=None)
+                    loss_z, *_ = criterion(sel_z, y_z, expert_id=expert_id, gate_w=None, target_indices=[z_idx])
+                    loss_p, *_ = criterion(sel_p, y_p, expert_id=expert_id, gate_w=None, target_indices=list(other_inds))
                     loss = loss_z + loss_p
                 else:
                     exps = out["expert_outputs"]["all"]  # (B,4,T)

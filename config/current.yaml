@@ -37,6 +37,7 @@ feature_cols:
 - omega (-)
 - p_c (Pa)
 - T_c (K)
+- mu ((J*m^3/kmol)^0.5)
 gate:
   activation: relu
   dropout: 0.05
@@ -53,8 +54,12 @@ loss:
   lambda_relative: 0.0
   lambda_smooth: 0.0
   region_weights:
-    enabled: false
-    weights: {}
+    enabled: true
+    weights:
+      1: 1.0
+      2: 1.0
+      3: 2.0
+      4: 1.2
   supervised: mse
   target_normalize:
     enabled: true
@@ -75,36 +80,30 @@ optuna:
   study_name: uni_pvt_mo
 paths:
   data: data/Water.csv
-  save_dir: results/2026-01-11_14-21-50
-  scaler: results/2026-01-11_14-21-50/scaler.pkl
+  save_dir: results/2026-01-11_16-53-30
+  scaler: results/2026-01-11_16-53-30/scaler.pkl
 pinn:
   R: 8.31446261815324
   enabled: true
-  h_name: H (J/mol)
   input_mode: reduced
   lambda_H: 0.05
   lambda_S: 0.05
   lambda_phi: 0.05
-  p_feature: P (MPa)
+  p_feature: p_r (-)
   p_to_Pa: 1.0e6
-  phi_name: phi (-)
-  s_name: S (J/mol/K)
   schedule:
     apply_in_finetune: true
     apply_in_gate_train: true
     apply_in_pretrain: false
-  t_feature: T (K)
+  t_feature: T_r (-)
   z_name: Z (-)
 shap:
   enabled: true
   max_samples: 2000
 targets:
 - Z (-)
-- phi (-)
-- H (J/mol)
-- S (J/mol/K)
 training:
-  batch_size: 256
+  batch_size: 128
   early_stopping:
     enabled: true
     min_delta: 0.0
@@ -118,12 +117,12 @@ training:
     - liquid
     - critical
     - extra
-  gate_epochs: 200
+  gate_epochs: 50
   gate_temperature_schedule:
     enabled: true
     end: 0.8
     start: 1.5
   learning_rate: 0.0017
-  pretrain_epochs: 100
+  pretrain_epochs: 30
   seed: 42
   weight_decay: 0.0

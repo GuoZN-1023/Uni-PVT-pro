@@ -596,6 +596,11 @@ def main():
     ap.add_argument("--save_dir", default=None, help="训练输出目录（包含 checkpoints/best_model.pt）")
     ap.add_argument("--split", default="test", choices=["train", "val", "test"], help="checkpoint 模式下选择哪一段数据")
     ap.add_argument("--outdir", default=None, help="输出目录。默认与 CSV 同级创建 pt_viz/ 或 save_dir/pt_viz/")
+    ap.add_argument(
+        "--target",
+        default=None,
+        help="可选：当 CSV 是多目标输出（predict.py 的 y_true::xxx / y_pred::xxx）时，指定要可视化的目标名 xxx",
+    )
     ap.add_argument("--prop", default=None, help="可选：目标物性名（辅助识别列）")
     ap.add_argument("--diff_mode", default="pred_minus_true", choices=["pred_minus_true", "abs"], help="差值定义")
     args = ap.parse_args()
@@ -610,17 +615,34 @@ def main():
         base_for_out = os.path.abspath(args.save_dir)
 
     df = compute_PT(df)
-    cols = infer_columns(df, prop=args.prop)
-    col_r = cols["region"]
-    col_true = cols["y_true"]
-    col_pred = cols["y_pred"]
+
+    # region/expert id
+    col_r = _find_col(df, ["no", "expert_id", "region", "region_id", "phase", "expert"])
+    if col_r is None:
+        raise ValueError("找不到区域/专家编号列（no 或 expert_id）。")
+
+    # true/pred
+    if args.target:
+        col_true = f"y_true::{args.target}"
+        col_pred = f"y_pred::{args.target}"
+        if col_true not in df.columns or col_pred not in df.columns:
+            avail = [c for c in df.columns if str(c).startswith("y_true::")]
+            hint = "，".join(avail[:12]) + (" ..." if len(avail) > 12 else "")
+            raise ValueError(
+                f"指定 target={args.target} 但找不到列：{col_true} / {col_pred}。"
+                f"\n可用 y_true 目标列示例：{hint}"
+            )
+    else:
+        cols = infer_columns(df, prop=args.prop)
+        col_true = cols["y_true"]
+        col_pred = cols["y_pred"]
 
     df[col_r] = df[col_r].astype(int)
 
     outdir = args.outdir or os.path.join(base_for_out, "pt_viz")
     os.makedirs(outdir, exist_ok=True)
 
-    value_label = args.prop or "Value"
+    value_label = args.prop or args.target or "Value"
 
     # --- True vs Pred ---
     fig_3d = make_3d_true_pred(df, col_true, col_pred, col_r, "原始值 vs 预测值：随 P、T 变化的 3D 分布", value_label)

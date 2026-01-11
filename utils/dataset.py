@@ -443,6 +443,35 @@ def get_dataloaders(cfg: dict):
         full_dataset, [n_train, n_val, n_test], generator=g
     )
 
+    # -----------------------------
+    # Multi-target scale statistics
+    # -----------------------------
+    # Multi-target regression often mixes variables with very different units.
+    # Instead of forcing the network to chase the largest-magnitude target,
+    # we compute per-target scales (std on the TRAIN split) and store them in cfg.
+    # The loss can then use (pred-target)/scale for a balanced objective, while
+    # model outputs remain in physical units (PINN stays consistent).
+    try:
+        # `random_split` returns Subset with .indices
+        train_indices = getattr(train_set, "indices", None)
+        if train_indices is None:
+            train_indices = list(range(len(train_set)))
+
+        y_all = getattr(full_dataset, "y", None)
+        tcols = list(getattr(full_dataset, "target_cols", []))
+        if y_all is not None and tcols:
+            y_tr = y_all[np.asarray(train_indices, dtype=np.int64)]
+            # std per target
+            std = np.nanstd(y_tr, axis=0).astype(np.float32)
+            std = np.where(std < 1e-12, 1.0, std)
+
+            cfg.setdefault("loss", {})
+            cfg["loss"].setdefault("target_scale_mode", "std")
+            cfg["loss"]["target_scales"] = {tcols[i]: float(std[i]) for i in range(len(tcols))}
+    except Exception as e:
+        # Keep dataloader creation robust; if this fails, training can still proceed.
+        print(f"[get_dataloaders] Warning: failed to compute target scales: {e}")
+
     bs = int((cfg.get("training", {}) or {}).get("batch_size", 256))
     return {
         "train": DataLoader(train_set, batch_size=bs, shuffle=True),

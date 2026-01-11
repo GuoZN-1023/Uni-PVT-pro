@@ -62,7 +62,36 @@ class PhysicsLoss(nn.Module):
             if parsed:
                 self.region_weights = parsed
 
-    def _data_loss_per_sample(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # -----------------------------
+        # Target scale normalization (multi-target stability)
+        # -----------------------------
+        # If cfg['loss']['target_scales'] is provided (dict: target_name -> scale),
+        # we normalize the supervised residual by scale per target: ((pred-target)/scale)^2.
+        # This balances gradients while keeping model outputs in physical units
+        # (so PINN constraints continue to make sense).
+        self.target_scales = None
+        self.target_order = None
+
+        # target order (matches dataset/heads output order)
+        resolved = cfg.get('resolved', {}) or {}
+        data_meta = cfg.get('data_meta', {}) or {}
+        self.target_order = resolved.get('target_cols', None) or data_meta.get('target_cols', None)
+
+        # parse scales
+        ts = ls.get('target_scales', None)
+        if ts is None:
+            ts = tr.get('target_scales', None)
+        parsed_scales = {}
+        if isinstance(ts, dict):
+            for k, v in ts.items():
+                try:
+                    parsed_scales[str(k)] = float(v)
+                except Exception:
+                    continue
+        if parsed_scales:
+            self.target_scales = parsed_scales
+
+    def _data_loss_per_sample(self, pred: torch.Tensor, target: torch.Tensor, *, target_indices=None) -> torch.Tensor:
         """
         返回每个样本一个标量 loss，shape (B,)
 
@@ -72,6 +101,29 @@ class PhysicsLoss(nn.Module):
             pred = pred.unsqueeze(1)
         if target.dim() == 1:
             target = target.unsqueeze(1)
+
+        # ----- optional per-target scaling for stability -----
+        # scale is aligned to the current pred/target columns
+        if self.target_scales is not None:
+            names = None
+            if target_indices is not None and self.target_order is not None:
+                try:
+                    names = [self.target_order[int(i)] for i in list(target_indices)]
+                except Exception:
+                    names = None
+            if names is None and self.target_order is not None and pred.size(1) == len(self.target_order):
+                names = list(self.target_order)
+
+            if names is not None:
+                scales = [float(self.target_scales.get(str(n), 1.0)) for n in names]
+                scale_t = pred.new_tensor(scales).view(1, -1)
+                scale_t = torch.clamp(scale_t, min=1e-12)
+            else:
+                # fallback: still protect against division by zero
+                scale_t = pred.new_ones((1, pred.size(1)))
+
+            pred = pred / scale_t
+            target = target / scale_t
 
         if self.loss_type == "huber":
             # per-element
@@ -90,6 +142,7 @@ class PhysicsLoss(nn.Module):
         gate_weights=None,
         *,
         expert_id: torch.Tensor | None = None,
+        target_indices=None,
         gate_w=None,
         **kwargs,
     ):
@@ -106,7 +159,7 @@ class PhysicsLoss(nn.Module):
             gate_weights = gate_w
 
         # ----- data loss per sample -----
-        data_loss_per_sample = self._data_loss_per_sample(fused_pred, target)  # (B,)
+        data_loss_per_sample = self._data_loss_per_sample(fused_pred, target, target_indices=target_indices)  # (B,)
 
         # ----- region weighting -----
         if self.region_weights is not None and expert_id is not None:

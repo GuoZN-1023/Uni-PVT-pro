@@ -63,6 +63,32 @@ def run_cmd(cmd, stdout_path: str, stderr_path: str, runall_log: str, cwd=None, 
     return result.returncode
 
 
+def _safe_slug(s: str, max_len: int = 80) -> str:
+    s = str(s)
+    out = []
+    for ch in s:
+        out.append(ch if (ch.isalnum() or ch in "-_+") else "_")
+    slug = "".join(out).strip("_")
+    return slug[:max_len] if slug else "target"
+
+
+def _infer_targets_from_pred_csv(pred_csv_path: str):
+    """从 predict.py 输出的 test_predictions.csv 里读取目标名列表（y_true::xxx / y_pred::xxx）。"""
+    try:
+        with open(pred_csv_path, "r", encoding="utf-8", errors="replace") as f:
+            header = f.readline().strip("\n")
+        cols = [c.strip() for c in header.split(",") if c.strip()]
+        y_true_cols = [c for c in cols if c.startswith("y_true::")]
+        targets = []
+        for c in y_true_cols:
+            tgt = c.split("::", 1)[1]
+            if f"y_pred::{tgt}" in cols:
+                targets.append(tgt)
+        return targets
+    except Exception:
+        return []
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/config.yaml")
@@ -102,6 +128,8 @@ def main():
     pred_err = os.path.join(logs_dir, "predict.stderr.log")
     shap_out = os.path.join(logs_dir, "shap.stdout.log")
     shap_err = os.path.join(logs_dir, "shap.stderr.log")
+    ptviz_out = os.path.join(logs_dir, "pt_viz.stdout.log")
+    ptviz_err = os.path.join(logs_dir, "pt_viz.stderr.log")
 
     _append(runall_log, "\n===== STAGE: TRAIN =====")
     run_cmd([python_exec, "train.py", "--config", exp_config_path],
@@ -124,6 +152,53 @@ def main():
             _append(runall_log, f"[run_all] SHAP failed (rc={shap_rc}). See:\n  {shap_err}\n  {os.path.join(exp_dir, 'shap', 'crash.log')}")
     else:
         _append(runall_log, "[run_all] SHAP disabled. Set shap.enabled: true in config to enable.")
+
+    # ---- PT 可视化（HTML dashboard）----
+    ptviz_cfg = cfg.get("pt_viz", {}) or {}
+    ptviz_enabled = bool(ptviz_cfg.get("enabled", True))
+    ptviz_allow_fail = bool(ptviz_cfg.get("allow_fail", True))
+    ptviz_diff_mode = str(ptviz_cfg.get("diff_mode", "pred_minus_true"))
+
+    _append(runall_log, f"\n===== STAGE: PT_VIZ (enabled={ptviz_enabled}, allow_fail={ptviz_allow_fail}, diff_mode={ptviz_diff_mode}) =====")
+
+    ptviz_html_map = {}
+    if ptviz_enabled:
+        pred_csv = os.path.join(exp_dir, "eval", "test_predictions.csv")
+        if os.path.exists(pred_csv):
+            targets = _infer_targets_from_pred_csv(pred_csv)
+            if targets:
+                for tgt in targets:
+                    slug = _safe_slug(tgt)
+                    outdir = os.path.join(exp_dir, "pt_viz", slug)
+                    rc = run_cmd(
+                        [python_exec, "pt_viz.py", "--csv", pred_csv, "--outdir", outdir, "--target", tgt, "--diff_mode", ptviz_diff_mode],
+                        stdout_path=ptviz_out,
+                        stderr_path=ptviz_err,
+                        runall_log=runall_log,
+                        allow_fail=ptviz_allow_fail,
+                    )
+                    if rc == 0:
+                        html = os.path.join(outdir, "pt_viz_dashboard.html")
+                        if os.path.exists(html):
+                            ptviz_html_map[tgt] = os.path.abspath(html)
+            else:
+                # 单目标兼容：predict.py 会写 y_true/y_pred
+                outdir = os.path.join(exp_dir, "pt_viz")
+                rc = run_cmd(
+                    [python_exec, "pt_viz.py", "--csv", pred_csv, "--outdir", outdir, "--diff_mode", ptviz_diff_mode],
+                    stdout_path=ptviz_out,
+                    stderr_path=ptviz_err,
+                    runall_log=runall_log,
+                    allow_fail=ptviz_allow_fail,
+                )
+                if rc == 0:
+                    html = os.path.join(outdir, "pt_viz_dashboard.html")
+                    if os.path.exists(html):
+                        ptviz_html_map["__single__"] = os.path.abspath(html)
+        else:
+            _append(runall_log, f"[run_all] PT_VIZ skipped: prediction csv not found: {pred_csv}")
+    else:
+        _append(runall_log, "[run_all] PT_VIZ disabled. Set pt_viz.enabled: true in config to enable.")
 
     summary_path = os.path.join(exp_dir, "summary.json")
     summary = {}
@@ -149,7 +224,14 @@ def main():
             "predict_stderr": os.path.abspath(pred_err),
             "shap_stdout": os.path.abspath(shap_out),
             "shap_stderr": os.path.abspath(shap_err),
+            "pt_viz_stdout": os.path.abspath(ptviz_out),
+            "pt_viz_stderr": os.path.abspath(ptviz_err),
         },
+    })
+
+    summary.setdefault("PtVizArtifacts", {})
+    summary["PtVizArtifacts"].update({
+        "dashboards": ptviz_html_map,
     })
 
     with open(summary_path, "w", encoding="utf-8") as f:

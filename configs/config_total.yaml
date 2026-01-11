@@ -21,13 +21,14 @@ feature_cols:
   - "omega (-)"
   - "p_c (Pa)"
   - "T_c (K)"
+  - "mu ((J*m^3/kmol)^0.5)"
 
 # 你要预测的输出列名（一次训练多个）
 targets:
   - "Z (-)"
-  - "phi (-)"
-  - "H (J/mol)"
-  - "S (J/mol/K)"
+  #- "phi (-)"
+  #- "H (J/mol)"
+  #- "S (J/mol/K)"
 
 # ---- Model: Mixture-of-Experts ----
 experts:
@@ -62,17 +63,17 @@ model:
 # ---- Training Strategy (3-stage) ----
 training:
   seed: 42
-  batch_size: 256
+  batch_size: 128
 
   # Optimizer base LR（各阶段共享起点，内部可按阶段衰减或独立设置）
   learning_rate: 0.0017
   weight_decay: 0.0
 
   # Stage-1: 只预训练专家（hard routing by no）
-  pretrain_epochs: 100
+  pretrain_epochs: 30
 
   # Stage-2: 冻结专家，只训练 gate（用于稳定融合与相区边界）
-  gate_epochs: 200
+  gate_epochs: 50
 
   # Stage-3: 联合微调（默认：gate + 全部专家或部分专家）
   finetune:
@@ -105,8 +106,8 @@ loss:
 
   # 区域权重（按 no 相区编号加权，可不启用）
   region_weights:
-    enabled: false
-    weights: {}              # 例如 {1: 1.0, 2: 1.0, 3: 2.0, 4: 1.2}
+    enabled: true
+    weights: {1: 1.0, 2: 1.0, 3: 2.0, 4: 1.2}     # 例如 {1: 1.0, 2: 1.0, 3: 2.0, 4: 1.2}
 
   # 物理与数值正则项（保持你原有项）
   lambda_nonneg: 3.08e-05
@@ -129,13 +130,13 @@ pinn:
 
   # 目标列名映射（必须与 targets 一致）
   z_name: "Z (-)"
-  phi_name: "phi (-)"
-  h_name: "H (J/mol)"
-  s_name: "S (J/mol/K)"
+  #phi_name: "phi (-)"
+  #h_name: "H (J/mol)"
+  #s_name: "S (J/mol/K)"
 
   # 从 feature_cols 中挑出 P 与 T 的列名（必须存在）
-  p_feature: "P (MPa)"
-  t_feature: "T (K)"
+  p_feature: "p_r (-)"
+  t_feature: "T_r (-)"
 
   # 单位换算：把 p_feature 的数值转成 Pa
   # 若 P 用 MPa -> 1e6；kPa -> 1e3；Pa -> 1
