@@ -6,11 +6,22 @@
 
 # ---- Data & I/O ----
 paths:
-  data: data/Water.csv
+  data: data
   # run_all 通常会把每次实验写到 results/<timestamp>/ 下
   # 这里作为默认兜底
   save_dir: results/latest
   scaler: results/latest/scaler.pkl
+
+data:
+  split:
+    train_ratio: 0.80
+    val_ratio: 0.10
+    test_ratio: 0.10
+
+  sampling:
+    enabled: true
+    total_rows: 1000000
+    pattern: "*.csv"       # 需要的话也可以写成 "mol_*.csv"
 
 # 相区编号列（必须存在）
 expert_col: "no"

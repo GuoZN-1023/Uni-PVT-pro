@@ -340,10 +340,21 @@ class ZDataset(Dataset):
         subset_cfg = cfg.get("subset", None)
         df_needed = apply_subset(df_needed, subset_cfg=subset_cfg, expert_col=expert_col)
 
-        # 2) 输出用 num_df：尽量保持旧项目行为（把“状态变量”一并带进 test_predictions.csv）
-        # - 取 CSV 中原本就为数值的列
+        # 2) 输出用 num_df：尽量保持旧项目行为（把“状态变量”一并带进输出 CSV）
+        # - 默认只取 CSV 中原本就为数值的列
+        # - 允许额外保留少量“元信息列”（例如 molecule_id），用于跨分子任务的追踪
         # - 再把 needed_cols 强制数值化写回，确保这些列一定包含在输出里
         num_df = df_raw.select_dtypes(include=[np.number]).copy()
+        meta_cols = _get_cfg(cfg, "meta_cols", None)
+        if meta_cols is None:
+            meta_cols = (cfg.get("data", {}) or {}).get("meta_cols", ["molecule_id"])
+        if isinstance(meta_cols, str):
+            meta_cols = [meta_cols]
+        if isinstance(meta_cols, (list, tuple)):
+            for mc in meta_cols:
+                if mc in df_raw.columns and mc not in num_df.columns:
+                    num_df[mc] = df_raw[mc]
+
         for c in needed_cols:
             num_df[c] = pd.to_numeric(df_raw[c], errors="coerce")
 
@@ -413,10 +424,19 @@ def get_dataloaders(cfg: dict):
     train.py 会在拿到 dataloaders 后把它写回 cfg['model']。
     """
     paths = cfg.get("paths", {}) or {}
+
+    # If explicit split CSVs exist, prefer them (for reproducible sampling pipelines).
+    train_path = paths.get("train_data", None)
+    val_path = paths.get("val_data", None)
+    test_path = paths.get("test_data", None)
+
     data_path = paths.get("data", None)
     scaler_path = paths.get("scaler", None)
-    if not data_path:
-        raise ValueError("Missing paths.data in config. Please set paths.data to your CSV file path.")
+
+    if not (train_path and val_path and test_path) and not data_path:
+        raise ValueError(
+            "Missing dataset paths. Provide either paths.data (single CSV) or paths.train_data/val_data/test_data."
+        )
     if not scaler_path:
         # default to save_dir/scaler.pkl if not provided
         save_dir = paths.get("save_dir", "results/latest")
@@ -424,24 +444,45 @@ def get_dataloaders(cfg: dict):
         paths["scaler"] = scaler_path
         cfg["paths"] = paths
 
-    set_seed(42)
+    seed = int((cfg.get("training", {}) or {}).get("seed", 42))
+    set_seed(seed)
 
-    full_dataset = ZDataset(
-        csv_path=data_path,
-        scaler_path=scaler_path,
-        cfg=cfg,
-        train=True,
-    )
+    if train_path and val_path and test_path:
+        # Reproducible explicit splits.
+        train_set = ZDataset(csv_path=train_path, scaler_path=scaler_path, cfg=cfg, train=True)
+        val_set = ZDataset(csv_path=val_path, scaler_path=scaler_path, cfg=cfg, train=False)
+        test_set = ZDataset(csv_path=test_path, scaler_path=scaler_path, cfg=cfg, train=False)
+        full_dataset = train_set  # for scale stats below
+        train_indices = None
+    else:
+        # Backward compatible: one CSV + random split.
+        full_dataset = ZDataset(
+            csv_path=data_path,
+            scaler_path=scaler_path,
+            cfg=cfg,
+            train=True,
+        )
 
-    n_total = len(full_dataset)
-    n_train = int(0.8 * n_total)
-    n_val = int(0.1 * n_total)
-    n_test = n_total - n_train - n_val
+        n_total = len(full_dataset)
+        split_cfg = (cfg.get("data", {}) or {}).get("split", {}) if isinstance(cfg.get("data", None), dict) else {}
+        train_ratio = float(split_cfg.get("train_ratio", 0.8))
+        val_ratio = float(split_cfg.get("val_ratio", 0.1))
+        test_ratio = float(split_cfg.get("test_ratio", 0.1))
+        s = train_ratio + val_ratio + test_ratio
+        if s <= 0:
+            train_ratio, val_ratio, test_ratio = 0.8, 0.1, 0.1
+            s = 1.0
+        train_ratio, val_ratio, test_ratio = train_ratio / s, val_ratio / s, test_ratio / s
 
-    g = torch.Generator().manual_seed(42)
-    train_set, val_set, test_set = torch.utils.data.random_split(
-        full_dataset, [n_train, n_val, n_test], generator=g
-    )
+        n_train = int(train_ratio * n_total)
+        n_val = int(val_ratio * n_total)
+        n_test = n_total - n_train - n_val
+
+        g = torch.Generator().manual_seed(seed)
+        train_set, val_set, test_set = torch.utils.data.random_split(
+            full_dataset, [n_train, n_val, n_test], generator=g
+        )
+        train_indices = getattr(train_set, "indices", None)
 
     # -----------------------------
     # Multi-target scale statistics
@@ -452,16 +493,14 @@ def get_dataloaders(cfg: dict):
     # The loss can then use (pred-target)/scale for a balanced objective, while
     # model outputs remain in physical units (PINN stays consistent).
     try:
-        # `random_split` returns Subset with .indices
-        train_indices = getattr(train_set, "indices", None)
-        if train_indices is None:
-            train_indices = list(range(len(train_set)))
-
+        # If explicit split is used, `train_set` is the full training dataset already.
         y_all = getattr(full_dataset, "y", None)
         tcols = list(getattr(full_dataset, "target_cols", []))
         if y_all is not None and tcols:
-            y_tr = y_all[np.asarray(train_indices, dtype=np.int64)]
-            # std per target
+            if train_indices is None:
+                y_tr = y_all
+            else:
+                y_tr = y_all[np.asarray(train_indices, dtype=np.int64)]
             std = np.nanstd(y_tr, axis=0).astype(np.float32)
             std = np.where(std < 1e-12, 1.0, std)
 
@@ -469,7 +508,6 @@ def get_dataloaders(cfg: dict):
             cfg["loss"].setdefault("target_scale_mode", "std")
             cfg["loss"]["target_scales"] = {tcols[i]: float(std[i]) for i in range(len(tcols))}
     except Exception as e:
-        # Keep dataloader creation robust; if this fails, training can still proceed.
         print(f"[get_dataloaders] Warning: failed to compute target scales: {e}")
 
     bs = int((cfg.get("training", {}) or {}).get("batch_size", 256))

@@ -113,12 +113,22 @@ def main():
         raise
 
     # ---- dataset ----
-    dataset = ZDataset(
-        csv_path=cfg["paths"]["data"],
-        scaler_path=cfg["paths"]["scaler"],
-        cfg=cfg,
-        train=False,
-    )
+    paths = cfg.get("paths", {}) or {}
+    scaler_path = paths["scaler"]
+    train_csv = paths.get("train_data", None)
+    test_csv = paths.get("test_data", None)
+    data_csv = paths.get("data", None)
+
+    if train_csv and test_csv:
+        train_ds = ZDataset(csv_path=train_csv, scaler_path=scaler_path, cfg=cfg, train=False)
+        test_ds = ZDataset(csv_path=test_csv, scaler_path=scaler_path, cfg=cfg, train=False)
+        dataset = test_ds  # for dims/cols only
+    else:
+        if not data_csv:
+            raise ValueError("shap_analysis.py requires paths.train_data/test_data or paths.data")
+        dataset = ZDataset(csv_path=data_csv, scaler_path=scaler_path, cfg=cfg, train=False)
+        train_ds, test_ds = None, None
+
     target_cols = list(getattr(dataset, "target_cols", []))
     feature_names = list(getattr(dataset, "feature_cols", []))
 
@@ -126,12 +136,17 @@ def main():
     cfg["model"]["input_dim"] = int(dataset.input_dim)
     cfg["model"]["output_dim"] = int(getattr(dataset, "output_dim", len(target_cols) or 1))
 
-    n_total = len(dataset)
-    n_train = int(0.8 * n_total)
-    n_val = int(0.1 * n_total)
-    n_test = n_total - n_train - n_val
-    g = torch.Generator().manual_seed(42)
-    train_set, _, test_set = random_split(dataset, [n_train, n_val, n_test], generator=g)
+    if train_ds is not None and test_ds is not None:
+        train_set = train_ds
+        test_set = test_ds
+    else:
+        n_total = len(dataset)
+        n_train = int(0.8 * n_total)
+        n_val = int(0.1 * n_total)
+        n_test = n_total - n_train - n_val
+        seed = int((cfg.get("training", {}) or {}).get("seed", 42))
+        g = torch.Generator().manual_seed(seed)
+        train_set, _, test_set = random_split(dataset, [n_train, n_val, n_test], generator=g)
 
     model = FusionModel(cfg).to(device)
     ckpt_path = os.path.join(save_dir, "checkpoints", "best_model.pt")
@@ -228,7 +243,7 @@ def main():
         df_bar = (
             pd.DataFrame({"feature": feature_names, "mean_abs_shap": mean_abs})
             .sort_values("mean_abs_shap", ascending=False)
-        )        
+        )
         bar_csv = None
         shap_csv = None
         if save_csv:

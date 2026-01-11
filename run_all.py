@@ -142,6 +142,8 @@ def main():
     shutil.copy(exp_config_path, os.path.join("config", "current.yaml"))
 
     python_exec = sys.executable
+    ds_out = os.path.join(logs_dir, "prepare_dataset.stdout.log")
+    ds_err = os.path.join(logs_dir, "prepare_dataset.stderr.log")
     train_out = os.path.join(logs_dir, "train.stdout.log")
     train_err = os.path.join(logs_dir, "train.stderr.log")
     pred_out = os.path.join(logs_dir, "predict.stdout.log")
@@ -152,6 +154,68 @@ def main():
     ptviz_err = os.path.join(logs_dir, "pt_viz.stderr.log")
     ptcmp_out = os.path.join(logs_dir, "pt_predtrue_compare.stdout.log")
     ptcmp_err = os.path.join(logs_dir, "pt_predtrue_compare.stderr.log")
+
+    # ===== Optional: build sampled dataset from many per-molecule CSVs =====
+    # If you provide `paths.molecules_dir` (and enable data.sampling), run_all will
+    # create exp_dir/dataset/{train,val,test}.csv and wire them into config_used.yaml.
+    paths_cfg = cfg.get("paths", {}) or {}
+    data_cfg = cfg.get("data", {}) or {}
+    sampling_cfg = (data_cfg.get("sampling", {}) or {}) if isinstance(data_cfg, dict) else {}
+    molecules_dir = paths_cfg.get("molecules_dir", None)
+    ds_enabled = bool(sampling_cfg.get("enabled", False)) or bool(molecules_dir)
+
+    if ds_enabled:
+        if not molecules_dir:
+            raise ValueError("Dataset sampling enabled but paths.molecules_dir is not set.")
+        dataset_dir = os.path.join(exp_dir, "dataset")
+        split_cfg = (data_cfg.get("split", {}) or {}) if isinstance(data_cfg, dict) else {}
+        train_ratio = float(split_cfg.get("train_ratio", 0.8))
+        val_ratio = float(split_cfg.get("val_ratio", 0.1))
+        test_ratio = float(split_cfg.get("test_ratio", 0.1))
+        seed = int((cfg.get("training", {}) or {}).get("seed", 42))
+        total_rows = int(sampling_cfg.get("total_rows", 1_000_000))
+        pattern = str(sampling_cfg.get("pattern", "*.csv"))
+        expert_col = str(cfg.get("expert_col", "no"))
+
+        _append(runall_log, "\n===== STAGE: PREP_DATASET =====")
+        run_cmd(
+            [
+                python_exec,
+                "prepare_dataset.py",
+                "--molecules_dir",
+                str(molecules_dir),
+                "--outdir",
+                str(dataset_dir),
+                "--total_rows",
+                str(total_rows),
+                "--expert_col",
+                expert_col,
+                "--pattern",
+                pattern,
+                "--train_ratio",
+                str(train_ratio),
+                "--val_ratio",
+                str(val_ratio),
+                "--test_ratio",
+                str(test_ratio),
+                "--seed",
+                str(seed),
+            ],
+            stdout_path=ds_out,
+            stderr_path=ds_err,
+            runall_log=runall_log,
+        )
+
+        # Wire split files into config (train/predict/shap will consume them)
+        cfg.setdefault("paths", {})
+        cfg["paths"]["train_data"] = os.path.join(dataset_dir, "train.csv")
+        cfg["paths"]["val_data"] = os.path.join(dataset_dir, "val.csv")
+        cfg["paths"]["test_data"] = os.path.join(dataset_dir, "test.csv")
+
+        # Persist updated config
+        with open(exp_config_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg, f, allow_unicode=True)
+        shutil.copy(exp_config_path, os.path.join("config", "current.yaml"))
 
     _append(runall_log, "\n===== STAGE: TRAIN =====")
     run_cmd([python_exec, "train.py", "--config", exp_config_path],

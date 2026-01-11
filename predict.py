@@ -104,15 +104,20 @@ def main():
     logger.info(f"Config: {os.path.abspath(args.config)}")
 
     # ---- dataset (train=False: reuse scaler) ----
-    data_path = cfg["paths"]["data"]
-    scaler_path = cfg["paths"]["scaler"]
+    paths = cfg.get("paths", {}) or {}
+    scaler_path = paths["scaler"]
 
-    dataset = ZDataset(
-        csv_path=data_path,
-        scaler_path=scaler_path,
-        cfg=cfg,
-        train=False,
-    )
+    # Preferred: explicit split files produced by prepare_dataset.py
+    test_csv = paths.get("test_data", None)
+    data_path = paths.get("data", None)
+
+    if test_csv:
+        dataset = ZDataset(csv_path=test_csv, scaler_path=scaler_path, cfg=cfg, train=False)
+    else:
+        # Backward compatible: single CSV + random split
+        if not data_path:
+            raise ValueError("predict.py requires either paths.test_data or paths.data")
+        dataset = ZDataset(csv_path=data_path, scaler_path=scaler_path, cfg=cfg, train=False)
 
     target_cols = list(getattr(dataset, "target_cols", []))
     feature_cols = list(getattr(dataset, "feature_cols", []))
@@ -126,26 +131,34 @@ def main():
     cfg["model"]["input_dim"] = int(dataset.input_dim)
     cfg["model"]["output_dim"] = int(getattr(dataset, "output_dim", len(target_cols) or 1))
 
-    # ---- split (must match train.py seed/ratios) ----
-    n_total = len(dataset)
-    n_train = int(0.8 * n_total)
-    n_val = int(0.1 * n_total)
-    n_test = n_total - n_train - n_val
-    g = torch.Generator().manual_seed(42)
-    _, _, test_set = random_split(dataset, [n_train, n_val, n_test], generator=g)
-
+    # ---- test loader ----
     batch_size = int(cfg["training"]["batch_size"])
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+    if test_csv:
+        test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        test_expert_ids = np.asarray(dataset.expert_ids).astype(int)
+        df_test_states = getattr(dataset, "num_df", None)
+        if df_test_states is not None:
+            df_test_states = df_test_states.reset_index(drop=True)
+    else:
+        # split (must match train.py seed/ratios)
+        n_total = len(dataset)
+        n_train = int(0.8 * n_total)
+        n_val = int(0.1 * n_total)
+        n_test = n_total - n_train - n_val
+        seed = int((cfg.get("training", {}) or {}).get("seed", 42))
+        g = torch.Generator().manual_seed(seed)
+        _, _, test_set = random_split(dataset, [n_train, n_val, n_test], generator=g)
+        test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
 
-    test_indices = np.array(test_set.indices, dtype=int)
-    test_expert_ids = np.asarray(dataset.expert_ids)[test_indices].astype(int)
+        test_indices = np.array(test_set.indices, dtype=int)
+        test_expert_ids = np.asarray(dataset.expert_ids)[test_indices].astype(int)
 
-    df_test_states = None
-    if hasattr(dataset, "num_df") and dataset.num_df is not None:
-        try:
-            df_test_states = dataset.num_df.iloc[test_indices].reset_index(drop=True)
-        except Exception as e:
-            logger.warning(f"Failed to slice dataset.num_df for test set: {e}")
+        df_test_states = None
+        if hasattr(dataset, "num_df") and dataset.num_df is not None:
+            try:
+                df_test_states = dataset.num_df.iloc[test_indices].reset_index(drop=True)
+            except Exception as e:
+                logger.warning(f"Failed to slice dataset.num_df for test set: {e}")
 
     # ---- load checkpoint ----
     model = FusionModel(cfg).to(device)
