@@ -8,6 +8,32 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 
+import time
+
+
+def _atomic_joblib_dump(obj, path: str):
+    """Write joblib file atomically to avoid partial-file reads in multi-process launches."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + f".tmp.{os.getpid()}"
+    joblib.dump(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _retry_joblib_load(path: str, retries: int = 20, sleep_s: float = 0.2):
+    """Retry load to survive races when multiple ranks start at once."""
+    last = None
+    for _ in range(max(1, retries)):
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return joblib.load(path)
+        except Exception as e:
+            last = e
+        time.sleep(sleep_s)
+    if last is not None:
+        raise last
+    raise FileNotFoundError(f"Scaler not found or empty: {path}")
+
+
 
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
@@ -306,6 +332,19 @@ class ZDataset(Dataset):
 
         df_raw = pd.read_csv(csv_path)
 
+        # ---- Optional: shrink dataset size from YAML (fast debugging / ablations) ----
+        # data.limit_rows: int or null
+        # data.limit_rows_shuffle: bool (default false)
+        limit_rows = (cfg.get("data", {}) or {}).get("limit_rows", None)
+        if limit_rows is not None:
+            limit_rows = int(limit_rows)
+            if limit_rows > 0 and len(df_raw) > limit_rows:
+                if bool((cfg.get("data", {}) or {}).get("limit_rows_shuffle", False)):
+                    seed = int(((cfg.get("training", {}) or {}).get("seed", 42)))
+                    df_raw = df_raw.sample(n=limit_rows, random_state=seed).reset_index(drop=True)
+                else:
+                    df_raw = df_raw.iloc[:limit_rows].copy()
+
         # 解析列选择：优先使用 config 中的 feature_cols / targets（列名），否则回退锚定推断
         feature_cols_raw, chosen_targets, expert_col = resolve_columns_from_config(
             list(df_raw.columns), cfg=cfg
@@ -390,11 +429,11 @@ class ZDataset(Dataset):
             scaler = StandardScaler()
             Xs = scaler.fit_transform(X)
             os.makedirs(os.path.dirname(self.scaler_path), exist_ok=True)
-            joblib.dump(scaler, self.scaler_path)
+            _atomic_joblib_dump(scaler, self.scaler_path)
         else:
             if not os.path.exists(self.scaler_path):
                 raise FileNotFoundError(f"Scaler not found: {self.scaler_path} (run train first?)")
-            scaler = joblib.load(self.scaler_path)
+            scaler = _retry_joblib_load(self.scaler_path)
             Xs = scaler.transform(X)
 
 
@@ -456,6 +495,13 @@ def get_dataloaders(cfg: dict):
         train_indices = None
     else:
         # Backward compatible: one CSV + random split.
+        if data_path and os.path.isdir(str(data_path)):
+            raise IsADirectoryError(
+                f"paths.data points to a directory: {data_path}. "
+                "If this folder contains many per-molecule CSVs, set paths.molecules_dir (and enable data.sampling) "
+                "so run_all can build train/val/test split files under results/<timestamp>/dataset/. "
+                "Otherwise, set paths.data to a single CSV file path."
+            )
         full_dataset = ZDataset(
             csv_path=data_path,
             scaler_path=scaler_path,

@@ -9,12 +9,18 @@ from datetime import datetime
 import yaml
 import subprocess
 
+# Keep a global copy so the outer exception handler can still read config
+BASE_CFG = {}
+
 
 def _ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
+    if p:
+        os.makedirs(p, exist_ok=True)
 
 
 def _append(path: str, msg: str):
+    if not path:
+        return
     _ensure_dir(os.path.dirname(path))
     with open(path, "a", encoding="utf-8") as f:
         f.write(msg if msg.endswith("\n") else msg + "\n")
@@ -31,23 +37,24 @@ def run_cmd(cmd, stdout_path: str, stderr_path: str, runall_log: str, cwd=None, 
     with open(stdout_path, "a", encoding="utf-8") as out_f, open(stderr_path, "a", encoding="utf-8") as err_f:
         out_f.write(f"\n========== CMD START: {' '.join(cmd)} ==========\n")
         err_f.write(f"\n========== CMD START: {' '.join(cmd)} ==========\n")
-        out_f.flush(); err_f.flush()
+        out_f.flush()
+        err_f.flush()
 
         result = subprocess.run(cmd, cwd=cwd, stdout=out_f, stderr=err_f)
 
         out_f.write(f"========== CMD END (returncode={result.returncode}) ==========\n")
         err_f.write(f"========== CMD END (returncode={result.returncode}) ==========\n")
-        out_f.flush(); err_f.flush()
+        out_f.flush()
+        err_f.flush()
 
     _append(runall_log, f"[run_all] Return code: {result.returncode}")
 
     if result.returncode != 0 and not allow_fail:
-        # Surface the last part of stderr to make debugging easier.
         tail = ""
         try:
             with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
-            tail_lines = lines[-120:]  # last ~120 lines
+            tail_lines = lines[-120:]
             tail = "".join(tail_lines)
         except Exception:
             tail = "(failed to read stderr log tail)"
@@ -73,7 +80,7 @@ def _safe_slug(s: str, max_len: int = 80) -> str:
 
 
 def _infer_targets_from_pred_csv(pred_csv_path: str):
-    """从 predict.py 输出的 test_predictions.csv 里读取目标名列表（y_true::xxx / y_pred::xxx）。"""
+    """Infer target names from export csv header: y_true::xxx / y_pred::xxx"""
     try:
         with open(pred_csv_path, "r", encoding="utf-8", errors="replace") as f:
             header = f.readline().strip("\n")
@@ -90,9 +97,7 @@ def _infer_targets_from_pred_csv(pred_csv_path: str):
 
 
 def _cleanup_extra_csv(exp_dir: str, keep_abs_paths: set[str], runall_log: str):
-    """Delete all .csv under exp_dir except the ones in keep_abs_paths.
-    Keep plots/html/images/logs/etc. This is to keep outputs tidy.
-    """
+    """Delete all .csv under exp_dir except those in keep_abs_paths."""
     removed = 0
     for root, _, files in os.walk(exp_dir):
         for fn in files:
@@ -109,6 +114,35 @@ def _cleanup_extra_csv(exp_dir: str, keep_abs_paths: set[str], runall_log: str):
     _append(runall_log, f"[run_all] CSV cleanup removed {removed} extra csv files.")
 
 
+def _resolve_root_results_dir(base_cfg: dict) -> str:
+    """
+    A-mode directory scheme:
+      exp_dir = <root_results_dir>/<timestamp>/
+
+    Priority:
+      1) paths.root_results
+      2) paths.save_dir (if endswith /latest, use its parent)
+      3) "results" (relative)
+    """
+    paths_cfg = base_cfg.get("paths", {}) or {}
+    root = paths_cfg.get("root_results", None)
+
+    if not root:
+        save_dir = paths_cfg.get("save_dir", None)
+        if save_dir:
+            # If user gave a "latest" pointer path, treat its parent as root.
+            base = os.path.basename(os.path.normpath(save_dir))
+            if base.lower() == "latest":
+                root = os.path.dirname(os.path.normpath(save_dir))
+            else:
+                root = save_dir
+
+    if not root:
+        root = "results"
+
+    return root
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config/config.yaml")
@@ -116,32 +150,45 @@ def main():
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
-        base_cfg = yaml.safe_load(f)
+        base_cfg = yaml.safe_load(f) or {}
+
+    global BASE_CFG
+    BASE_CFG = base_cfg
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    root_results_dir = base_cfg.get("paths", {}).get("root_results", "results")
+
+    # A mode: exp_dir = root_results_dir/timestamp
+    root_results_dir = _resolve_root_results_dir(base_cfg)
     exp_dir = os.path.join(root_results_dir, timestamp)
+
     logs_dir = os.path.join(exp_dir, "logs")
-    _ensure_dir(exp_dir); _ensure_dir(logs_dir); _ensure_dir(os.path.join(exp_dir, "checkpoints"))
+    _ensure_dir(exp_dir)
+    _ensure_dir(logs_dir)
+    _ensure_dir(os.path.join(exp_dir, "checkpoints"))
 
     runall_log = os.path.join(logs_dir, "run_all.log")
     _append(runall_log, "========== RUN_ALL START ==========")
     _append(runall_log, f"timestamp: {timestamp}")
+    _append(runall_log, f"root_results_dir: {os.path.abspath(root_results_dir)}")
     _append(runall_log, f"exp_dir:    {os.path.abspath(exp_dir)}")
     _append(runall_log, f"base_config:{os.path.abspath(args.config)}")
 
+    # Make a working cfg copy and force save_dir/scaler under exp_dir
     cfg = dict(base_cfg)
     cfg.setdefault("paths", {})
+    cfg["paths"]["root_results"] = root_results_dir
     cfg["paths"]["save_dir"] = exp_dir
     cfg["paths"]["scaler"] = os.path.join(exp_dir, "scaler.pkl")
 
     exp_config_path = os.path.join(exp_dir, "config_used.yaml")
     with open(exp_config_path, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True)
+
     _ensure_dir("config")
     shutil.copy(exp_config_path, os.path.join("config", "current.yaml"))
 
     python_exec = sys.executable
+
     ds_out = os.path.join(logs_dir, "prepare_dataset.stdout.log")
     ds_err = os.path.join(logs_dir, "prepare_dataset.stderr.log")
     train_out = os.path.join(logs_dir, "train.stdout.log")
@@ -156,23 +203,38 @@ def main():
     ptcmp_err = os.path.join(logs_dir, "pt_predtrue_compare.stderr.log")
 
     # ===== Optional: build sampled dataset from many per-molecule CSVs =====
-    # If you provide `paths.molecules_dir` (and enable data.sampling), run_all will
-    # create exp_dir/dataset/{train,val,test}.csv and wire them into config_used.yaml.
     paths_cfg = cfg.get("paths", {}) or {}
     data_cfg = cfg.get("data", {}) or {}
     sampling_cfg = (data_cfg.get("sampling", {}) or {}) if isinstance(data_cfg, dict) else {}
+
     molecules_dir = paths_cfg.get("molecules_dir", None)
+
+    # Backward-compatible convenience:
+    # If paths.data points to a DIRECTORY (containing many molecule CSVs), treat it as molecules_dir
+    data_path = paths_cfg.get("data", None)
+    if (not molecules_dir) and data_path and os.path.isdir(data_path):
+        molecules_dir = data_path
+        cfg.setdefault("paths", {})
+        cfg["paths"]["molecules_dir"] = molecules_dir
+
     ds_enabled = bool(sampling_cfg.get("enabled", False)) or bool(molecules_dir)
 
     if ds_enabled:
         if not molecules_dir:
-            raise ValueError("Dataset sampling enabled but paths.molecules_dir is not set.")
+            raise ValueError(
+                "Dataset sampling enabled but no molecules directory was provided. "
+                "Set paths.molecules_dir to the folder containing molecule CSVs "
+                "(or ensure paths.data points to a directory, not a single CSV)."
+            )
+
         dataset_dir = os.path.join(exp_dir, "dataset")
+
         split_cfg = (data_cfg.get("split", {}) or {}) if isinstance(data_cfg, dict) else {}
         train_ratio = float(split_cfg.get("train_ratio", 0.8))
         val_ratio = float(split_cfg.get("val_ratio", 0.1))
         test_ratio = float(split_cfg.get("test_ratio", 0.1))
         seed = int((cfg.get("training", {}) or {}).get("seed", 42))
+
         total_rows = int(sampling_cfg.get("total_rows", 1_000_000))
         pattern = str(sampling_cfg.get("pattern", "*.csv"))
         expert_col = str(cfg.get("expert_col", "no"))
@@ -218,37 +280,56 @@ def main():
         shutil.copy(exp_config_path, os.path.join("config", "current.yaml"))
 
     _append(runall_log, "\n===== STAGE: TRAIN =====")
-    run_cmd([python_exec, "train.py", "--config", exp_config_path],
-            stdout_path=train_out, stderr_path=train_err, runall_log=runall_log)
+    run_cmd(
+        [python_exec, "train.py", "--config", exp_config_path],
+        stdout_path=train_out,
+        stderr_path=train_err,
+        runall_log=runall_log,
+    )
 
-    _append(runall_log, "\n===== STAGE: PREDICT =====")
-    run_cmd([python_exec, "export_results.py", "--config", exp_config_path, "--outdir", os.path.join(exp_dir, "exports")],
-            stdout_path=pred_out, stderr_path=pred_err, runall_log=runall_log)
+    _append(runall_log, "\n===== STAGE: EXPORT_RESULTS =====")
+    run_cmd(
+        [python_exec, "export_results.py", "--config", exp_config_path, "--outdir", os.path.join(exp_dir, "exports")],
+        stdout_path=pred_out,
+        stderr_path=pred_err,
+        runall_log=runall_log,
+    )
 
-    shap_cfg = cfg.get("shap", {})
+    shap_cfg = cfg.get("shap", {}) or {}
     shap_enabled = bool(shap_cfg.get("enabled", False))
     _append(runall_log, f"\n===== STAGE: SHAP (enabled={shap_enabled}, strict={args.shap_strict}) =====")
 
     shap_rc = None
     if shap_enabled:
-        shap_rc = run_cmd([python_exec, "shap_analysis.py", "--config", exp_config_path],
-                          stdout_path=shap_out, stderr_path=shap_err, runall_log=runall_log,
-                          allow_fail=(not args.shap_strict))
+        shap_rc = run_cmd(
+            [python_exec, "shap_analysis.py", "--config", exp_config_path],
+            stdout_path=shap_out,
+            stderr_path=shap_err,
+            runall_log=runall_log,
+            allow_fail=(not args.shap_strict),
+        )
         if shap_rc != 0:
-            _append(runall_log, f"[run_all] SHAP failed (rc={shap_rc}). See:\n  {shap_err}\n  {os.path.join(exp_dir, 'shap', 'crash.log')}")
+            _append(
+                runall_log,
+                f"[run_all] SHAP failed (rc={shap_rc}). See:\n  {shap_err}\n  {os.path.join(exp_dir, 'shap', 'crash.log')}",
+            )
     else:
         _append(runall_log, "[run_all] SHAP disabled. Set shap.enabled: true in config to enable.")
 
-    # ---- PT 可视化（HTML dashboard）----
+    # ---- PT visualization (HTML dashboard) ----
     ptviz_cfg = cfg.get("pt_viz", {}) or {}
     ptviz_enabled = bool(ptviz_cfg.get("enabled", True))
     ptviz_allow_fail = bool(ptviz_cfg.get("allow_fail", True))
     ptviz_diff_mode = str(ptviz_cfg.get("diff_mode", "pred_minus_true"))
 
-    _append(runall_log, f"\n===== STAGE: PT_VIZ (enabled={ptviz_enabled}, allow_fail={ptviz_allow_fail}, diff_mode={ptviz_diff_mode}) =====")
+    _append(
+        runall_log,
+        f"\n===== STAGE: PT_VIZ (enabled={ptviz_enabled}, allow_fail={ptviz_allow_fail}, diff_mode={ptviz_diff_mode}) =====",
+    )
 
     ptviz_html_map = {}
     ptcmp_html_map = {}
+
     if ptviz_enabled:
         pred_csv = os.path.join(exp_dir, "exports", "finetune_test_predictions.csv")
         if os.path.exists(pred_csv):
@@ -269,8 +350,6 @@ def main():
                         if os.path.exists(html):
                             ptviz_html_map[tgt] = os.path.abspath(html)
 
-                    # --- Pred-vs-True Compare (Pretrain/Gate/Finetune in one HTML) ---
-                    # Use the 6 clean exports as inputs; never writes extra CSV.
                     exports_dir = os.path.join(exp_dir, "exports")
                     cmp_html = os.path.join(exp_dir, "pt_viz", f"pred_true_compare__{slug}.html")
                     expert_col = str(cfg.get("expert_col", "no"))
@@ -284,7 +363,6 @@ def main():
                     if rc2 == 0 and os.path.exists(cmp_html):
                         ptcmp_html_map[tgt] = os.path.abspath(cmp_html)
             else:
-                # 单目标兼容：predict.py 会写 y_true/y_pred
                 outdir = os.path.join(exp_dir, "pt_viz")
                 rc = run_cmd(
                     [python_exec, "pt_viz.py", "--csv", pred_csv, "--outdir", outdir, "--diff_mode", ptviz_diff_mode],
@@ -298,7 +376,6 @@ def main():
                     if os.path.exists(html):
                         ptviz_html_map["__single__"] = os.path.abspath(html)
 
-                # single-target compare html
                 exports_dir = os.path.join(exp_dir, "exports")
                 cmp_html = os.path.join(exp_dir, "pt_viz", "pred_true_compare__single.html")
                 expert_col = str(cfg.get("expert_col", "no"))
@@ -316,6 +393,7 @@ def main():
     else:
         _append(runall_log, "[run_all] PT_VIZ disabled. Set pt_viz.enabled: true in config to enable.")
 
+    # ---- Summary update ----
     summary_path = os.path.join(exp_dir, "summary.json")
     summary = {}
     if os.path.exists(summary_path):
@@ -326,29 +404,33 @@ def main():
             summary = {}
 
     summary.setdefault("RunAll", {})
-    summary["RunAll"].update({
-        "timestamp": timestamp,
-        "exp_dir": os.path.abspath(exp_dir),
-        "config_used": os.path.abspath(exp_config_path),
-        "run_all_log": os.path.abspath(runall_log),
-        "shap_enabled": shap_enabled,
-        "shap_returncode": shap_rc,
-        "logs": {
-            "train_stdout": os.path.abspath(train_out),
-            "train_stderr": os.path.abspath(train_err),
-            "predict_stdout": os.path.abspath(pred_out),
-            "predict_stderr": os.path.abspath(pred_err),
-            "shap_stdout": os.path.abspath(shap_out),
-            "shap_stderr": os.path.abspath(shap_err),
-            "pt_viz_stdout": os.path.abspath(ptviz_out),
-            "pt_viz_stderr": os.path.abspath(ptviz_err),
-            "pt_predtrue_compare_stdout": os.path.abspath(ptcmp_out),
-            "pt_predtrue_compare_stderr": os.path.abspath(ptcmp_err),
-        },
-    })
+    summary["RunAll"].update(
+        {
+            "timestamp": timestamp,
+            "root_results_dir": os.path.abspath(root_results_dir),
+            "exp_dir": os.path.abspath(exp_dir),
+            "config_used": os.path.abspath(exp_config_path),
+            "run_all_log": os.path.abspath(runall_log),
+            "shap_enabled": shap_enabled,
+            "shap_returncode": shap_rc,
+            "logs": {
+                "prepare_dataset_stdout": os.path.abspath(ds_out),
+                "prepare_dataset_stderr": os.path.abspath(ds_err),
+                "train_stdout": os.path.abspath(train_out),
+                "train_stderr": os.path.abspath(train_err),
+                "export_stdout": os.path.abspath(pred_out),
+                "export_stderr": os.path.abspath(pred_err),
+                "shap_stdout": os.path.abspath(shap_out),
+                "shap_stderr": os.path.abspath(shap_err),
+                "pt_viz_stdout": os.path.abspath(ptviz_out),
+                "pt_viz_stderr": os.path.abspath(ptviz_err),
+                "pt_predtrue_compare_stdout": os.path.abspath(ptcmp_out),
+                "pt_predtrue_compare_stderr": os.path.abspath(ptcmp_err),
+            },
+        }
+    )
 
-    
-    # Keep only the 6 export CSVs; remove any other CSV artifacts created by submodules.
+    # ---- Keep only the 6 export CSVs; remove any other CSV artifacts created by submodules. ----
     exports_dir = os.path.join(exp_dir, "exports")
     keep_names = [
         "pretrain_best_predictions.csv",
@@ -358,16 +440,11 @@ def main():
         "finetune_test_predictions.csv",
         "finetune_test_metrics.csv",
     ]
-    keep_abs = set()
-    for name in keep_names:
-        keep_abs.add(os.path.abspath(os.path.join(exports_dir, name)))
+    keep_abs = set(os.path.abspath(os.path.join(exports_dir, name)) for name in keep_names)
     _cleanup_extra_csv(exp_dir, keep_abs_paths=keep_abs, runall_log=runall_log)
 
     summary.setdefault("PtVizArtifacts", {})
-    summary["PtVizArtifacts"].update({
-        "dashboards": ptviz_html_map,
-        "pred_true_compare": ptcmp_html_map,
-    })
+    summary["PtVizArtifacts"].update({"dashboards": ptviz_html_map, "pred_true_compare": ptcmp_html_map})
 
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -378,7 +455,6 @@ def main():
 
 
 if __name__ == "__main__":
-
     try:
         main()
         sys.exit(0)
@@ -387,15 +463,20 @@ if __name__ == "__main__":
     except Exception:
         tb = traceback.format_exc()
 
+        # Try best-effort logging even when crash happens early.
         try:
-            root = "results"
-            candidate = "run_all_error.log"
+            root = _resolve_root_results_dir(BASE_CFG) if isinstance(BASE_CFG, dict) else "results"
+            candidate = os.path.join(root, "run_all_error.log")
+
             if os.path.isdir(root):
+                # If there are subdirs, try write into the latest run's logs
                 subdirs = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
                 if subdirs:
                     candidate = os.path.join(root, subdirs[-1], "logs", "run_all.log")
+
             _append(candidate, "\n❌ RUN_ALL FAILED")
             _append(candidate, tb)
         except Exception:
             pass
+
         sys.exit(1)

@@ -1,4 +1,3 @@
-
 # models/fusion_model.py
 from __future__ import annotations
 import torch
@@ -147,6 +146,8 @@ class FusionModel(nn.Module):
             fused, w, exps = self.head_all(x)
             return {
                 "fused": fused,
+                "pred": fused,          # ✅ 兼容旧 trainer：常用键名
+                "experts": exps,        # ✅ 兼容旧 trainer：需要 (B,4,T)
                 "gate_w": {"all": w},
                 "expert_outputs": {"all": exps},
                 "aux": {
@@ -179,11 +180,12 @@ class FusionModel(nn.Module):
         # Reassemble expert outputs to (B,4,T)
         exps_all = torch.zeros((B, 4, T), device=x.device, dtype=z_pred.dtype)
         exps_all[:, :, self.z_out_idx:self.z_out_idx + 1] = exps_z  # (B,4,1)
-
         exps_all[:, :, other_indices] = exps_p  # (B,4,To)
 
         return {
             "fused": fused_all,
+            "pred": fused_all,        # ✅ 兼容旧 trainer
+            "experts": exps_all,      # ✅ 兼容旧 trainer：需要 (B,4,T)
             "gate_w": {"z": w_z, "props": w_p},
             "expert_outputs": {"z": exps_z, "props": exps_p, "all": exps_all},
             "aux": {

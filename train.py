@@ -3,12 +3,14 @@ import os
 import argparse
 import yaml
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from models.fusion_model import FusionModel
 from utils.dataset import get_dataloaders
 from utils.physics_loss import PhysicsLoss
 from utils.trainer import train_model
 from utils.logger import get_file_logger
+from utils.distributed import init_distributed, destroy_distributed
 
 
 def _unwrap_dataset(ds):
@@ -71,6 +73,11 @@ def main():
     _bridge_loss_cfg_to_training(cfg)
 
 
+    # ---------------------------
+    # Distributed (optional)
+    # ---------------------------
+    dist = init_distributed()
+
     save_dir = cfg["paths"]["save_dir"]
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(os.path.join(save_dir, "logs"), exist_ok=True)
@@ -80,11 +87,21 @@ def main():
     cfg["paths"]["scaler"] = cfg["paths"].get("scaler", os.path.join(save_dir, "scaler.pkl"))
 
 
-    log_file = os.path.join(save_dir, "logs", "training.log")
-    logger = get_file_logger(log_file, name="train")
+    # Avoid multi-rank log collisions: rank0 writes canonical training.log;
+    # other ranks write training_rank{rank}.log (useful for debugging).
+    if dist.is_main:
+        log_file = os.path.join(save_dir, "logs", "training.log")
+        logger = get_file_logger(log_file, name="train")
+    else:
+        log_file = os.path.join(save_dir, "logs", f"training_rank{dist.rank}.log")
+        logger = get_file_logger(log_file, name=f"train_rank{dist.rank}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Device: {device}")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", dist.local_rank if dist.enabled else 0)
+    else:
+        device = torch.device("cpu")
+    if dist.is_main:
+        logger.info(f"Device: {device} (ddp_enabled={dist.enabled}, world_size={dist.world_size}, rank={dist.rank})")
 
     dataloaders = get_dataloaders(cfg)
 
@@ -123,6 +140,16 @@ def main():
         yaml.dump(cfg, f, allow_unicode=True)
 
     model = FusionModel(cfg).to(device)
+    if dist.enabled:
+        # DDP will synchronize gradients so each rank trains on a different
+        # shard of data but updates the *same* model.
+        # MoE training often has "unused" parameters per step (e.g. experts not selected by the batch).
+        # DDP needs find_unused_parameters=True to avoid hanging reductions.
+        model = DDP(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            find_unused_parameters=True,
+        )
 
     criterion = PhysicsLoss(cfg)
 
@@ -130,6 +157,8 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     train_model(model, dataloaders, criterion, optimizer, cfg, device, logger)
+
+    destroy_distributed(dist)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,13 @@
 data:
-  limit_rows: null
-  num_workers: 2
+  limit_rows: 100000
+  num_workers: 4
   persistent_workers: true
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 4
+  sampling:
+    enabled: true
+    pattern: '*.csv'
+    total_rows: 100000
   split:
     seed: 42
     shuffle: true
@@ -86,9 +90,9 @@ loss:
     enabled: true
     weights:
       1: 1.0
-      2: 1.0
+      2: 1.5
       3: 2.0
-      4: 1.2
+      4: 1.0
   supervised: mse
   target_normalize:
     enabled: true
@@ -109,24 +113,32 @@ optuna:
   storage: null
   study_name: uni_pvt_mo
 paths:
-  data: data/Water.csv
-  save_dir: results/2026-01-11_23-24-57
-  scaler: results/2026-01-11_23-24-57/scaler.pkl
+  data: /home/thermo2025/Uni-PVT-Data-20260115-v1.0
+  molecules_dir: /home/thermo2025/Uni-PVT-Data-20260115-v1.0
+  root_results: /home/thermo2025/Uni-PVT_results/results_gzn_20260115
+  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/2026-01-15_23-37-11
+  scaler: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/2026-01-15_23-37-11/scaler.pkl
+  test_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/2026-01-15_23-37-11/dataset/test.csv
+  train_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/2026-01-15_23-37-11/dataset/train.csv
+  val_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/2026-01-15_23-37-11/dataset/val.csv
 pinn:
   R: 8.31446261815324
-  compute_every_steps: 2
+  compute_every_steps: 1
   enabled: true
+  h_name: H (J/mol)
   input_mode: reduced
-  lambda_H: 0.05
-  lambda_S: 0.05
-  lambda_phi: 0.05
-  p_feature: p_r (-)
-  p_to_Pa: 1.0e6
+  lambda_H: 0.0005
+  lambda_S: 0.0005
+  lambda_phi: 0.0005
+  p_to_Pa: 1.0
+  pc_feature: p_c (Pa)
+  pr_feature: p_r (-)
   schedule:
     apply_in_finetune: true
     apply_in_gate_train: true
     apply_in_pretrain: true
-  t_feature: T_r (-)
+  tc_feature: T_c (K)
+  tr_feature: T_r (-)
   z_name: Z (-)
 pt_viz:
   allow_fail: true
@@ -147,8 +159,9 @@ shap:
   save_csv: false
 targets:
 - Z (-)
+- H (J/mol)
 training:
-  batch_size: 128
+  batch_size: 512
   early_stopping:
     enabled: true
     min_delta: 0.0
@@ -194,6 +207,6 @@ training:
     - 0.999
     eps: 1.0e-08
     name: adamw
-  pretrain_epochs: 30
+  pretrain_epochs: 50
   seed: 42
   weight_decay: 0.0

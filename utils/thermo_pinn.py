@@ -6,6 +6,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _as_tensor(x, device: str | torch.device) -> torch.Tensor:
+    """
+    Robustly convert numpy/torch/scalar to torch.Tensor on device.
+    Keeps gradients OFF for scaler stats (they are constants).
+    """
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    # numpy.ndarray or python list/float/int
+    return torch.as_tensor(x, device=device)
+
+
 class ThermoPinnLoss(nn.Module):
     """Thermodynamics-informed PINN residuals (soft constraints).
 
@@ -29,8 +40,8 @@ class ThermoPinnLoss(nn.Module):
         *,
         feature_cols: list[str],
         target_cols: list[str],
-        scaler_mean: torch.Tensor,
-        scaler_scale: torch.Tensor,
+        scaler_mean,   # ✅ allow numpy/torch
+        scaler_scale,  # ✅ allow numpy/torch
         device: str | torch.device,
     ):
         super().__init__()
@@ -54,8 +65,9 @@ class ThermoPinnLoss(nn.Module):
         self.lambda_S = float(pinn.get("lambda_S", 0.0))
 
         # scaler params for converting grad wrt x_scaled into grad wrt x_raw
-        self.scaler_mean = scaler_mean.detach().to(device).float()
-        self.scaler_scale = torch.clamp(scaler_scale.detach().to(device).float(), min=1e-12)
+        # ✅ FIX: accept numpy.ndarray as input and convert to torch tensor BEFORE detach
+        self.scaler_mean = _as_tensor(scaler_mean, device).detach().float()
+        self.scaler_scale = torch.clamp(_as_tensor(scaler_scale, device).detach().float(), min=1e-12)
 
         # ---- absolute mode config ----
         self.p_feature = str(pinn.get("p_feature", "P (MPa)"))

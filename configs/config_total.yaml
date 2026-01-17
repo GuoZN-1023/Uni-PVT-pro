@@ -6,11 +6,16 @@
 
 # ---- Data & I/O ----
 paths:
-  data: data
+  data: /home/thermo2025/Uni-PVT-Data-20260115-v1.0  #用新数据请创建新目录存放数据，命名为Uni-PVT-Data-20260115-v1.0之类
   # run_all 通常会把每次实验写到 results/<timestamp>/ 下
   # 这里作为默认兜底
-  save_dir: results/latest
-  scaler: results/latest/scaler.pkl
+  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest # 每个人在results里给自己创建一个新的results目录，自己跑的结果放到自己的目录下，命名为results_gzn_20250115之类的
+  scaler: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/scaler.pkl
+  
+  # 明确指定 train/val/test 数据路径，导出数据需要
+  train_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/train.csv
+  val_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/val.csv
+  test_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/test.csv
 
 data:
   split:
@@ -20,8 +25,24 @@ data:
 
   sampling:
     enabled: true
-    total_rows: 1000000
+    total_rows: 100000
     pattern: "*.csv"       # 需要的话也可以写成 "mol_*.csv"
+
+  split:
+    train_ratio: 0.80
+    val_ratio: 0.10
+    test_ratio: 0.10
+    shuffle: true
+    seed: 42
+
+  # 加速用（CUDA 下有效）
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+  # 可选：只用部分数据做快速调试
+  limit_rows: 100000   # e.g. 20000
 
 # 相区编号列（必须存在）
 expert_col: "no"
@@ -39,25 +60,7 @@ targets:
   - "Z (-)"
   # - "phi (-)"
   # - "H (J/mol)"
-  # - "S (J/mol/K)"
-
-# ---- Dataset split & loader ----
-data:
-  split:
-    train_ratio: 0.80
-    val_ratio: 0.10
-    test_ratio: 0.10
-    shuffle: true
-    seed: 42
-
-  # 加速用（CUDA 下有效），Mac MPS 可把 num_workers 设小一些
-  num_workers: 2
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 2
-
-  # 可选：只用部分数据做快速调试
-  limit_rows: null   # e.g. 20000
+  - "S (J/mol/K)"
 
 # ---- Model: Mixture-of-Experts ----
 experts:
@@ -101,7 +104,7 @@ runtime:
 # ---- Training Strategy (3-stage) ----
 training:
   seed: 42
-  batch_size: 128
+  batch_size: 512
   gradient_clip_norm: 0.0      # 0 表示不裁剪；不稳定时可设 1.0 或 5.0
 
   # Optimizer base LR（阶段内 scheduler 会随 epoch 变化）
@@ -133,7 +136,7 @@ training:
       min_lr: 1.0e-6
 
   # Stage-1: 只预训练专家（hard routing by no）
-  pretrain_epochs: 30
+  pretrain_epochs: 50
 
   # Stage-2: 冻结专家，只训练 gate
   gate_epochs: 50
@@ -177,7 +180,7 @@ loss:
   # 按 no 的区域权重
   region_weights:
     enabled: true
-    weights: {1: 1.0, 2: 1.0, 3: 2.0, 4: 1.2}
+    weights: {1: 1.0, 2: 1.5, 3: 2.0, 4: 1.0}
 
   # 你原有的项
   lambda_nonneg: 3.08e-05
@@ -202,23 +205,25 @@ pinn:
   z_name: "Z (-)"
   # phi_name: "phi (-)"
   # h_name: "H (J/mol)"
-  # s_name: "S (J/mol/K)"
+  s_name: "S (J/mol/K)"
 
   # 从 feature_cols 中挑出 P 与 T 的列名（必须存在）
-  p_feature: "p_r (-)"
-  t_feature: "T_r (-)"
+  pr_feature: "p_r (-)"
+  tr_feature: "T_r (-)"
+  pc_feature: "p_c (Pa)"
+  tc_feature: "T_c (K)"
 
   # 单位换算：把 p_feature 的数值转成 Pa
   # 注意：如果 p_r 是 reduced pressure，本质上是无量纲，严格说不能乘 1e6 变 Pa
   # 这里按你目前的设定保留；若后面物理残差异常大/不收敛，再把这一项理顺
-  p_to_Pa: 1.0e6
+  p_to_Pa: 1.0
 
   R: 8.31446261815324 
 
   # PINN 残差权重
-  lambda_phi: 0.05
-  lambda_H: 0.05
-  lambda_S: 0.05
+  lambda_phi: 0.0005
+  lambda_H: 0.0005
+  lambda_S: 0.0005
 
   schedule:
     apply_in_pretrain: true
@@ -226,7 +231,7 @@ pinn:
     apply_in_finetune: true
 
   # PINN 抽稀（提速且更稳）：每 k 个 step 才计算一次 PINN（1 表示每步都算）
-  compute_every_steps: 2
+  compute_every_steps: 1
 
 # ---- Visualization (keep plots, avoid extra raw csv) ----
 pt_viz:
