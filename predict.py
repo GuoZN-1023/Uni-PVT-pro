@@ -33,7 +33,7 @@ def _model_forward(model, x):
             expert_all = next(iter(exps.values()))
     return fused, gate_w, expert_all
 from models.fusion_model import FusionModel
-from utils.dataset import ZDataset
+from utils.dataset import ZDataset, MolCachedZDataset
 from utils.logger import get_file_logger
 
 
@@ -105,19 +105,22 @@ def main():
 
     # ---- dataset (train=False: reuse scaler) ----
     paths = cfg.get("paths", {}) or {}
-    scaler_path = paths["scaler"]
+    mol_enabled = bool((cfg.get("mol_encoder") or {}).get("enabled", False))
+    scaler_path = paths.get("scaler", None)
 
     # Preferred: explicit split files produced by prepare_dataset.py
     test_csv = paths.get("test_data", None)
     data_path = paths.get("data", None)
 
     if test_csv:
-        dataset = ZDataset(csv_path=test_csv, scaler_path=scaler_path, cfg=cfg, train=False)
+        dataset = (MolCachedZDataset(csv_path=test_csv, cfg=cfg) if mol_enabled
+                   else ZDataset(csv_path=test_csv, scaler_path=scaler_path, cfg=cfg, train=False))
     else:
         # Backward compatible: single CSV + random split
         if not data_path:
             raise ValueError("predict.py requires either paths.test_data or paths.data")
-        dataset = ZDataset(csv_path=data_path, scaler_path=scaler_path, cfg=cfg, train=False)
+        dataset = (MolCachedZDataset(csv_path=data_path, cfg=cfg) if mol_enabled
+                   else ZDataset(csv_path=data_path, scaler_path=scaler_path, cfg=cfg, train=False))
 
     target_cols = list(getattr(dataset, "target_cols", []))
     feature_cols = list(getattr(dataset, "feature_cols", []))
@@ -171,10 +174,23 @@ def main():
     y_true_list, fused_list, w_list, experts_list = [], [], [], []
     w_z_list, w_props_list = [], []
 
+    def _to_device(obj):
+        if torch.is_tensor(obj):
+            return obj.to(device)
+        if isinstance(obj, dict):
+            return {k: _to_device(v) for k, v in obj.items()}
+        return obj
+
     with torch.no_grad():
-        for x, y, _eid in test_loader:
-            x = x.to(device)
-            y = y.to(device)
+        for batch in test_loader:
+            if isinstance(batch, dict):
+                y = _to_device(batch["y"])
+                x = _to_device({k: v for k, v in batch.items() if k != "y"})
+            else:
+                x, y, _eid = batch
+                x = _to_device(x)
+                y = _to_device(y)
+
             fused, w, expert_outputs = _model_forward(model, x)
             y_true_list.append(y.detach().cpu().numpy())
             fused_list.append(fused.detach().cpu().numpy())

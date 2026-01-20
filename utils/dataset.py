@@ -8,6 +8,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 
+from .mol_cache import MolCache
+
 import time
 
 
@@ -455,6 +457,110 @@ class ZDataset(Dataset):
         return x, y, expert_id
 
 
+class MolCachedZDataset(Dataset):
+    """Uni-PVT 2.0 dataset: load *cached* molecular encodings + physical state.
+
+    This dataset NEVER runs the heavy 3D encoder. It only reads precomputed arrays:
+      - z_conf: (K,D) conformer embeddings
+      - e_conf: (K,) relative conformer energies
+
+    and returns a dict so the model can do Boltzmann pooling + FiLM on the fly.
+
+    Expected config keys (all under cfg['mol_encoder']):
+      enabled: true
+      cache:
+        z_conf_path: /path/to/z_conf.npy
+        e_conf_path: /path/to/e_conf.npy
+        meta_path:   /path/to/meta.json (optional)
+        id_map_path: /path/to/mol_id_to_row.json (optional)
+      mol_id_col: molecule_id   # column in CSV used to lookup cache row
+      state_cols: ["T (K)", "P (Pa)"]  # used for FiLM + PINN
+
+    Targets/expert_col selection remains compatible with the legacy ZDataset.
+    """
+
+    def __init__(self, *, csv_path: str, cfg: dict):
+        super().__init__()
+
+        self.cfg = cfg
+        mcfg = (cfg.get("mol_encoder") or {})
+        if not bool(mcfg.get("enabled", False)):
+            raise ValueError("MolCachedZDataset requires cfg.mol_encoder.enabled: true")
+
+        cache_cfg = (mcfg.get("cache") or {})
+        self.cache = MolCache(
+            z_conf_path=str(cache_cfg.get("z_conf_path")),
+            e_conf_path=str(cache_cfg.get("e_conf_path")),
+            meta_path=cache_cfg.get("meta_path", None),
+            id_map_path=cache_cfg.get("id_map_path", None),
+        )
+
+        self.mol_id_col = str(mcfg.get("mol_id_col", "mol_id"))
+        self.state_cols = list(mcfg.get("state_cols", ["T (K)", "P (Pa)"]))
+        if len(self.state_cols) != 2:
+            raise ValueError(f"mol_encoder.state_cols must be length-2 [T_col, P_col], got {self.state_cols}")
+
+        self.expert_col = str(cfg.get("expert_col", "no"))
+
+        # target selection is identical to legacy
+        df = pd.read_csv(csv_path)
+        if self.mol_id_col not in df.columns:
+            raise ValueError(f"MolCachedZDataset missing mol_id_col={self.mol_id_col} in CSV columns")
+        for c in self.state_cols:
+            if c not in df.columns:
+                raise ValueError(f"MolCachedZDataset missing state col '{c}' in CSV columns")
+        if self.expert_col not in df.columns:
+            raise ValueError(f"MolCachedZDataset missing expert_col '{self.expert_col}' in CSV columns")
+
+        # targets: use cfg.targets if provided else infer from CSV like legacy
+        # legacy rule: variables between anchor_col (inclusive) and expert_col (exclusive)
+        anchor_col = str(cfg.get("anchor_col", "Z (-)"))
+        if isinstance(cfg.get("targets", None), list) and len(cfg["targets"]) > 0:
+            target_cols = list(cfg["targets"])
+        else:
+            if anchor_col not in df.columns:
+                raise ValueError(f"MolCachedZDataset missing anchor_col '{anchor_col}' in CSV; set cfg.targets explicitly.")
+            a = list(df.columns).index(anchor_col)
+            b = list(df.columns).index(self.expert_col)
+            if b <= a:
+                raise ValueError(f"Invalid columns order: anchor_col '{anchor_col}' must appear before expert_col '{self.expert_col}'.")
+            target_cols = list(df.columns)[a:b]
+
+        self.target_cols = target_cols
+        self.output_dim = int(len(self.target_cols))
+
+        # We intentionally do NOT scale state cols here.
+        self.mol_ids = df[self.mol_id_col].astype(str).tolist()
+        self.state_tp = df[self.state_cols].to_numpy(dtype=np.float32)  # (N,2)
+        self.expert_ids = df[self.expert_col].to_numpy(dtype=np.int64)  # (N,)
+        self.y = df[self.target_cols].to_numpy(dtype=np.float32)
+
+        # model input dim is the cached embedding dim (D)
+        self.input_dim = int(self.cache.embed_dim)
+
+        # For compatibility with downstream code
+        self.feature_cols = list(self.state_cols)  # used as metadata only
+        self.scaler = None
+        self.scaler_mean = None
+        self.scaler_scale = None
+        self.num_df = df  # keep for exports/debug
+
+    def __len__(self):
+        return int(len(self.mol_ids))
+
+    def __getitem__(self, idx: int):
+        mol_id = self.mol_ids[idx]
+        z_conf, e_conf = self.cache.get(mol_id)  # (K,D), (K,)
+        return {
+            "mol_id": mol_id,
+            "z_conf": torch.from_numpy(z_conf.astype(np.float32)),
+            "e_conf": torch.from_numpy(e_conf.astype(np.float32)),
+            "state": torch.from_numpy(self.state_tp[idx]),  # (2,)
+            "y": torch.from_numpy(self.y[idx]),
+            "expert_id": torch.tensor(self.expert_ids[idx], dtype=torch.long),
+        }
+
+
 def get_dataloaders(cfg: dict):
     """
     根据 config 构建 train/val/test DataLoader
@@ -463,6 +569,8 @@ def get_dataloaders(cfg: dict):
     train.py 会在拿到 dataloaders 后把它写回 cfg['model']。
     """
     paths = cfg.get("paths", {}) or {}
+
+    mol_enabled = bool((cfg.get("mol_encoder") or {}).get("enabled", False))
 
     # If explicit split CSVs exist, prefer them (for reproducible sampling pipelines).
     train_path = paths.get("train_data", None)
@@ -476,8 +584,9 @@ def get_dataloaders(cfg: dict):
         raise ValueError(
             "Missing dataset paths. Provide either paths.data (single CSV) or paths.train_data/val_data/test_data."
         )
+    # In Uni-PVT 2.0 mol-cache mode, the classic feature scaler is not required.
+    # We still keep paths.scaler for backward compatibility with other scripts.
     if not scaler_path:
-        # default to save_dir/scaler.pkl if not provided
         save_dir = paths.get("save_dir", "results/latest")
         scaler_path = os.path.join(save_dir, "scaler.pkl")
         paths["scaler"] = scaler_path
@@ -488,9 +597,14 @@ def get_dataloaders(cfg: dict):
 
     if train_path and val_path and test_path:
         # Reproducible explicit splits.
-        train_set = ZDataset(csv_path=train_path, scaler_path=scaler_path, cfg=cfg, train=True)
-        val_set = ZDataset(csv_path=val_path, scaler_path=scaler_path, cfg=cfg, train=False)
-        test_set = ZDataset(csv_path=test_path, scaler_path=scaler_path, cfg=cfg, train=False)
+        if mol_enabled:
+            train_set = MolCachedZDataset(csv_path=train_path, cfg=cfg)
+            val_set = MolCachedZDataset(csv_path=val_path, cfg=cfg)
+            test_set = MolCachedZDataset(csv_path=test_path, cfg=cfg)
+        else:
+            train_set = ZDataset(csv_path=train_path, scaler_path=scaler_path, cfg=cfg, train=True)
+            val_set = ZDataset(csv_path=val_path, scaler_path=scaler_path, cfg=cfg, train=False)
+            test_set = ZDataset(csv_path=test_path, scaler_path=scaler_path, cfg=cfg, train=False)
         full_dataset = train_set  # for scale stats below
         train_indices = None
     else:
@@ -502,12 +616,15 @@ def get_dataloaders(cfg: dict):
                 "so run_all can build train/val/test split files under results/<timestamp>/dataset/. "
                 "Otherwise, set paths.data to a single CSV file path."
             )
-        full_dataset = ZDataset(
-            csv_path=data_path,
-            scaler_path=scaler_path,
-            cfg=cfg,
-            train=True,
-        )
+        if mol_enabled:
+            full_dataset = MolCachedZDataset(csv_path=data_path, cfg=cfg)
+        else:
+            full_dataset = ZDataset(
+                csv_path=data_path,
+                scaler_path=scaler_path,
+                cfg=cfg,
+                train=True,
+            )
 
         n_total = len(full_dataset)
         split_cfg = (cfg.get("data", {}) or {}).get("split", {}) if isinstance(cfg.get("data", None), dict) else {}

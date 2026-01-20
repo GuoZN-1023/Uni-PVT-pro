@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from utils.dataset import ZDataset
+from utils.dataset import ZDataset, MolCachedZDataset
 from models.fusion_model import FusionModel
 
 
@@ -119,9 +119,23 @@ def _expert_pred_from_out(out: dict, eid: int) -> torch.Tensor:
 
 def _eval_fused(model, loader, device):
     ys, ps, eids = [], [], []
-    for x, y, expert_id in loader:
-        x = x.to(device)
-        y = y.to(device)
+    def _to_device(obj):
+        if torch.is_tensor(obj):
+            return obj.to(device)
+        if isinstance(obj, dict):
+            return {k: _to_device(v) for k, v in obj.items()}
+        return obj
+
+    for batch in loader:
+        if isinstance(batch, dict):
+            y = _to_device(batch["y"])
+            expert_id = _to_device(batch["expert_id"])
+            x = _to_device({k: v for k, v in batch.items() if k != "y"})
+        else:
+            x, y, expert_id = batch
+            x = _to_device(x)
+            y = _to_device(y)
+            expert_id = _to_device(expert_id)
         with torch.no_grad():
             out = model(x)
             pred = out["fused"]
@@ -136,14 +150,28 @@ def _eval_fused(model, loader, device):
 
 def _eval_expert(model, loader, device, eid: int):
     ys, ps, eids = [], [], []
-    for x, y, expert_id in loader:
+    def _to_device(obj):
+        if torch.is_tensor(obj):
+            return obj.to(device)
+        if isinstance(obj, dict):
+            return {k: _to_device(v) for k, v in obj.items()}
+        return obj
+
+    for batch in loader:
+        if isinstance(batch, dict):
+            y = _to_device(batch["y"])
+            expert_id = _to_device(batch["expert_id"])
+            x = _to_device({k: v for k, v in batch.items() if k != "y"})
+        else:
+            x, y, expert_id = batch
+            x = _to_device(x)
+            y = _to_device(y)
+            expert_id = _to_device(expert_id)
+
         expert_id_flat = expert_id.view(-1)
         mask = expert_id_flat == eid
         if not torch.any(mask):
             continue
-
-        x = x.to(device)
-        y = y.to(device)
         with torch.no_grad():
             out = model(x)
             pred_all = _expert_pred_from_out(out, eid)
@@ -197,12 +225,14 @@ def main():
 
     # ✅ FIX: these must be inside main() and properly indented
     data_path, _is_split_file = _resolve_csv_path_for_export(cfg, save_dir=save_dir)
+    mol_enabled = bool((cfg.get("mol_encoder") or {}).get("enabled", False))
     scaler_path = (cfg.get("paths", {}) or {}).get("scaler", None)
-    if not scaler_path:
+    if (not mol_enabled) and (not scaler_path):
         raise ValueError("config missing paths.scaler")
 
-    # Build dataset in inference mode (loads scaler)
-    ds = ZDataset(csv_path=data_path, scaler_path=scaler_path, cfg=cfg, train=False)
+    # Build dataset in inference mode
+    ds = (MolCachedZDataset(csv_path=data_path, cfg=cfg) if mol_enabled
+          else ZDataset(csv_path=data_path, scaler_path=scaler_path, cfg=cfg, train=False))
 
     target_cols = list(ds.target_cols)
     expert_col = ds.expert_col

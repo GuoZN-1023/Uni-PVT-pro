@@ -12,6 +12,54 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from .thermo_pinn import ThermoPinnLoss
 
 
+def _to_device(obj, device: torch.device):
+    """Recursively move tensors inside obj to device."""
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {k: _to_device(v, device) for k, v in obj.items()}
+    return obj
+
+
+def _unpack_batch(batch, device: torch.device):
+    """Support both legacy (x,y,eid) and Uni-PVT 2.0 (dict) batches."""
+    if isinstance(batch, dict):
+        b = _to_device(batch, device)
+        y = b["y"]
+        expert_id = b["expert_id"].view(-1)
+        # model input is the same dict (FusionModel can accept dict)
+        model_in = {k: b[k] for k in ["z_conf", "e_conf", "state", "expert_id"] if k in b}
+        return model_in, y, expert_id
+
+    # legacy: tuple/list
+    if isinstance(batch, (tuple, list)) and len(batch) == 3:
+        x, y, expert_id = batch
+        x = x.to(device)
+        y = y.to(device)
+        expert_id = expert_id.to(device).view(-1)
+        return x, y, expert_id
+
+    raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+
+def _prepare_pinn_inputs(model_in, *, enable_pinn: bool):
+    """Ensure the PINN input has gradients and is actually used by the model."""
+    if not enable_pinn:
+        return model_in, None
+
+    if isinstance(model_in, dict):
+        state = model_in.get("state", None)
+        if state is None:
+            raise ValueError("[PINN] dict batch missing 'state' (T,P).")
+        state_used = state.detach().requires_grad_(True)
+        model_in2 = dict(model_in)
+        model_in2["state"] = state_used
+        return model_in2, state_used
+
+    x_used = model_in.detach().requires_grad_(True)
+    return x_used, x_used
+
+
 def _as_2d(a: np.ndarray) -> np.ndarray:
     a = np.asarray(a)
     if a.ndim == 1:
@@ -286,12 +334,10 @@ def _eval_loss_and_metrics(
 
     ys, ps = [], []
 
-    for x, y, expert_id in loader:
-        x = x.to(device)
-        y = y.to(device)
-        expert_id = expert_id.to(device)
+    for batch in loader:
+        model_in, y, expert_id = _unpack_batch(batch, device)
 
-        out = model(x)
+        out = model(model_in)
         preds = _fused_from_experts(out, prefer_fused=True)
 
         gate_w = out.get("gate_w", None)
@@ -302,13 +348,13 @@ def _eval_loss_and_metrics(
 
         if pinn_active:
             with torch.enable_grad():
-                x_pinn = x.detach().requires_grad_(True)
-                out_p = model(x_pinn)
+                model_in_p, pinn_in = _prepare_pinn_inputs(model_in, enable_pinn=True)
+                out_p = model(model_in_p)
                 preds_p = _fused_from_experts(out_p, prefer_fused=True)
-                pinn_term, _ = pinn_loss(x_pinn, preds_p)
+                pinn_term = pinn_loss(pinn_in, preds_p)
                 loss = loss + pinn_term
 
-        b = float(x.shape[0])
+        b = float(y.shape[0])
         if loss_reduction == "sample_mean":
             total_loss += float(loss.item()) * b
             total_n += b
@@ -439,12 +485,10 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
             model.eval()
             totals = {eid: 0.0 for eid in (1, 2, 3, 4)}
             counts = {eid: 0 for eid in (1, 2, 3, 4)}
-            for x, y, expert_id in val_loader:
-                x = x.to(device)
-                y = y.to(device)
-                expert_id = expert_id.to(device).view(-1)
+            for batch in val_loader:
+                model_in, y, expert_id = _unpack_batch(batch, device)
 
-                out = model(x)
+                out = model(model_in)
                 preds_all = _experts_from_out(out)  # (N,E,T)
 
                 for eid in (1, 2, 3, 4):
@@ -463,11 +507,9 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
             running = 0.0
             n_batches = 0
 
-            for x, y, expert_id in train_loader:
+            for batch in train_loader:
                 global_step += 1
-                x = x.to(device)
-                y = y.to(device)
-                expert_id = expert_id.to(device)
+                model_in, y, expert_id = _unpack_batch(batch, device)
 
                 stage_name = "pretrain"
                 do_pinn = (
@@ -476,7 +518,8 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                     and _pinn_should_compute_this_step(cfg, global_step)
                 )
 
-                out, x_used = _forward_with_optional_pinn_input(model, x, enable_pinn=do_pinn)
+                model_in_p, pinn_in = _prepare_pinn_inputs(model_in, enable_pinn=do_pinn)
+                out = model(model_in_p)
                 experts_out = _experts_from_out(out)  # (N,E,T)
 
                 eidx = (expert_id.view(-1) - 1).clamp(min=0, max=3)
@@ -484,9 +527,8 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
 
                 loss, *_ = criterion(preds, y, expert_id=expert_id, gate_w=None)
 
-                if do_pinn:
-                    pinn_term, _ = pinn_loss(x_used, preds)
-                    loss = loss + pinn_term
+                if do_pinn and pinn_in is not None:
+                    loss = loss + pinn_loss(pinn_in, preds)
 
                 opt_experts.zero_grad(set_to_none=True)
                 loss.backward()
@@ -546,14 +588,13 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 frac = epoch / float(stage2_epochs - 1)
                 temperature = temp_start + frac * (temp_end - temp_start)
 
-            for x, y, expert_id in train_loader:
+            for batch in train_loader:
                 global_step += 1
-                x = x.to(device)
-                y = y.to(device)
-                expert_id = expert_id.to(device)
+                model_in, y, expert_id = _unpack_batch(batch, device)
 
                 do_pinn = pinn_active and _pinn_should_compute_this_step(cfg, global_step)
-                out, x_used = _forward_with_optional_pinn_input(model, x, enable_pinn=do_pinn)
+                model_in_p, pinn_in = _prepare_pinn_inputs(model_in, enable_pinn=do_pinn)
+                out = model(model_in_p)
 
                 gate_w = _gate_from_out(out)
                 if isinstance(gate_w, dict):
@@ -574,9 +615,8 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                     gate_w=out["gate_w"],
                 )
 
-                if do_pinn:
-                    pinn_term, _ = pinn_loss(x_used, preds)
-                    loss = loss + pinn_term
+                if do_pinn and pinn_in is not None:
+                    loss = loss + pinn_loss(pinn_in, preds)
 
                 opt_gates.zero_grad(set_to_none=True)
                 loss.backward()
@@ -589,7 +629,7 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 torch.nn.utils.clip_grad_norm_(params_to_clip, clip_grad)
                 opt_gates.step()
 
-                b = float(x.shape[0])
+                b = float(y.shape[0])
                 running_sum += float(loss.item()) * b
                 running_n += b
 
@@ -645,23 +685,21 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
             running_sum = 0.0
             running_n = 0.0
 
-            for x, y, expert_id in train_loader:
+            for batch in train_loader:
                 global_step += 1
-                x = x.to(device)
-                y = y.to(device)
-                expert_id = expert_id.to(device)
+                model_in, y, expert_id = _unpack_batch(batch, device)
 
                 do_pinn = pinn_active and _pinn_should_compute_this_step(cfg, global_step)
-                out, x_used = _forward_with_optional_pinn_input(model, x, enable_pinn=do_pinn)
+                model_in_p, pinn_in = _prepare_pinn_inputs(model_in, enable_pinn=do_pinn)
+                out = model(model_in_p)
 
                 preds = _fused_from_experts(out, prefer_fused=True)
                 gate_w = out.get("gate_w", None)
 
                 loss, *_ = criterion(preds, y, expert_id=expert_id, gate_w=gate_w)
 
-                if do_pinn:
-                    pinn_term, _ = pinn_loss(x_used, preds)
-                    loss = loss + pinn_term
+                if do_pinn and pinn_in is not None:
+                    loss = loss + pinn_loss(pinn_in, preds)
 
                 opt_joint.zero_grad(set_to_none=True)
                 loss.backward()
@@ -670,7 +708,7 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 torch.nn.utils.clip_grad_norm_(params_to_clip, clip_grad)
                 opt_joint.step()
 
-                b = float(x.shape[0])
+                b = float(y.shape[0])
                 running_sum += float(loss.item()) * b
                 running_n += b
 
