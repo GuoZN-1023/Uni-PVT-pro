@@ -35,6 +35,7 @@ class _NPZTable:
         self._npz = np.load(npz_path, allow_pickle=True)
         self.num_cols = [str(x) for x in self._npz["__cols__"].tolist()]
         self.data = self._npz["data"]
+        self._num_col2idx = {c: i for i, c in enumerate(self.num_cols)}
         # collect object columns
         self.obj = {}
         for k in self._npz.files:
@@ -51,7 +52,7 @@ class _NPZTable:
     def get_numeric(self, col: str) -> np.ndarray:
         if col not in self.num_cols:
             raise KeyError(f"Column '{col}' is not numeric in NPZ: {self.npz_path}")
-        j = self.num_cols.index(col)
+        j = self._num_col2idx[col]
         return self.data[:, j]
 
     def get_object(self, col: str) -> np.ndarray:
@@ -670,7 +671,29 @@ class NPZDataset(Dataset):
         if isinstance(meta_cols, str):
             meta_cols = [meta_cols]
 
-        num_df = pd.DataFrame({c: table.get_numeric(c)[idx][sub_idx] for c in table.num_cols})
+        # For exports/debug: keep a numeric dataframe. By default we keep only
+        # the columns that are actually needed (features + targets + expert + optional meta),
+        # to avoid duplicating the entire numeric matrix in memory.
+        npz_cfg = {}
+        if isinstance(cfg.get("data", None), dict):
+            npz_cfg = (cfg.get("data", {}) or {}).get("npz", {}) or {}
+        npz_cfg = {**(cfg.get("npz", {}) or {}), **npz_cfg}
+        keep_all_numeric = bool(npz_cfg.get("keep_all_numeric_cols", False))
+
+        if keep_all_numeric:
+            keep_num = list(table.num_cols)
+        else:
+            base = set(self.feature_cols) | set(self.target_cols) | {self.expert_col}
+            # include numeric meta cols if requested
+            for mc in (meta_cols or []):
+                if mc in table.num_cols:
+                    base.add(mc)
+            # preserve original column order as in the npz
+            keep_num = [c for c in table.num_cols if c in base]
+
+        num_df = pd.DataFrame({c: table.get_numeric(c)[idx][sub_idx] for c in keep_num})
+
+        # attach requested object meta cols
         for mc in meta_cols or []:
             if mc in table.obj:
                 num_df[mc] = table.get_object(mc)[idx][sub_idx]
@@ -1005,7 +1028,7 @@ def get_dataloaders(cfg: dict):
         # ZDataset(train=True) fits the scaler during construction, which would otherwise
         # see *all* samples. Here we re-fit the scaler on TRAIN indices only and re-transform
         # the whole dataset in-place so Subset(...) views remain valid.
-        if (not mol_enabled) and isinstance(full_dataset, ZDataset) and train_indices is not None:
+        if (not mol_enabled) and isinstance(full_dataset, (ZDataset, NPZDataset)) and train_indices is not None:
             import torch.distributed as dist
 
             def _refit_and_rescale_on_rank0():

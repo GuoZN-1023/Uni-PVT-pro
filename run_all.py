@@ -116,50 +116,98 @@ def _cleanup_extra_csv(exp_dir: str, keep_abs_paths: set[str], runall_log: str):
     _append(runall_log, f"[run_all] CSV cleanup removed {removed} extra csv files.")
 
 
-def _build_mol_cache_input_csv(molecules_dir: str, out_csv: str, *, pattern: str, mol_id_col: str, smiles_col: str) -> int:
+def _build_mol_cache_input_csv(
+    molecules_dir: str,
+    out_csv: str,
+    *,
+    pattern: str,
+    mol_id_col: str,
+    smiles_col: str,
+    runall_log: str | None = None,
+) -> int:
     """Scan per-molecule CSVs and write a compact (mol_id, SMILES) table.
 
-    We only read header + first data row from each file to keep it cheap.
+    We only read header + first non-empty data row from each file to keep it cheap.
     Returns number of unique molecules collected.
+
+    Extra: writes a small stats summary to run_all.log (if provided) so silent partial
+    failures don't go unnoticed.
     """
-    mol_map = {}
+    stats = {
+        "files_scanned": 0,
+        "files_matched": 0,
+        "ok": 0,
+        "skip_no_header": 0,
+        "skip_missing_cols": 0,
+        "skip_no_data_row": 0,
+        "skip_missing_values": 0,
+        "errors": 0,
+    }
+
+    mol_map: dict[str, str] = {}
     for root, _, files in os.walk(molecules_dir):
         for fn in files:
+            stats["files_scanned"] += 1
             if not fnmatch.fnmatch(fn, pattern):
                 continue
+            stats["files_matched"] += 1
             path = os.path.join(root, fn)
             try:
                 with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
                     reader = _csv.reader(f)
                     header = next(reader, None)
                     if not header:
+                        stats["skip_no_header"] += 1
                         continue
+
                     header = [h.strip() for h in header]
                     if mol_id_col not in header or smiles_col not in header:
+                        stats["skip_missing_cols"] += 1
                         continue
+
                     mi = header.index(mol_id_col)
                     si = header.index(smiles_col)
+
                     row = None
                     for r in reader:
-                        if r and any(x.strip() for x in r):
+                        if r and any(str(x).strip() for x in r):
                             row = r
                             break
                     if row is None or mi >= len(row) or si >= len(row):
+                        stats["skip_no_data_row"] += 1
                         continue
+
                     mid = str(row[mi]).strip()
                     smi = str(row[si]).strip()
                     if not mid or not smi:
+                        stats["skip_missing_values"] += 1
                         continue
+
                     mol_map.setdefault(mid, smi)
+                    stats["ok"] += 1
             except Exception:
+                stats["errors"] += 1
                 continue
 
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     with open(out_csv, "w", encoding="utf-8", newline="") as f:
         w = _csv.writer(f)
         w.writerow([mol_id_col, smiles_col])
-        for mid, smi in mol_map.items():
-            w.writerow([mid, smi])
+        # deterministic order helps reproducibility
+        for mid in sorted(mol_map.keys()):
+            w.writerow([mid, mol_map[mid]])
+
+    summary = (
+        f"[BUILD_MOL_CACHE_INPUT] scanned={stats['files_scanned']} matched={stats['files_matched']} "
+        f"ok_files={stats['ok']} unique_mols={len(mol_map)} "
+        f"skip(no_header={stats['skip_no_header']}, missing_cols={stats['skip_missing_cols']}, "
+        f"no_data_row={stats['skip_no_data_row']}, missing_values={stats['skip_missing_values']}) "
+        f"errors={stats['errors']}"
+    )
+    if runall_log:
+        _append(runall_log, summary)
+    else:
+        print(summary)
 
     return len(mol_map)
 
@@ -365,6 +413,7 @@ def main():
                 pattern=pattern,
                 mol_id_col=mol_id_col,
                 smiles_col=smiles_col,
+                runall_log=runall_log,
             )
             if n_mols == 0:
                 raise RuntimeError(
