@@ -195,10 +195,10 @@ class FusionModel(nn.Module):
     Your original 4-expert MoE model, extended to support a PINN-style *two-step* prediction path:
 
       Z prediction:     x -> MoE_Z -> Z
-      other properties: x -> MoE_Z -> Z, then concat([x, Z]) -> MoE_props -> other targets
+      other properties: x -> MoE_props -> other targets (NOT conditioned on Z as an input)
 
     This strictly follows the user's requested logic:
-      p,T,... -> Z -> (PINN-embedded) -> other thermo properties
+      p,T,... -> {Z, other props} with PINN coupling via loss (Z enters constraints, not inputs)
 
     If PINN is disabled (cfg.pinn.enabled=false), it behaves exactly like the original:
       x -> MoE_all -> all targets
@@ -279,7 +279,7 @@ class FusionModel(nn.Module):
         if self.cascade:
             self.head_z = _MoEHead(input_dim=self.input_dim, output_dim=1, cfg=cfg)
             self.head_props = _MoEHead(
-                input_dim=self.input_dim + 1, output_dim=len(self.other_target_cols), cfg=cfg
+                input_dim=self.input_dim, output_dim=len(self.other_target_cols), cfg=cfg
             )
         else:
             self.head_all = _MoEHead(input_dim=self.input_dim, output_dim=self.output_dim, cfg=cfg)
@@ -359,8 +359,7 @@ class FusionModel(nn.Module):
         z_pred = z_fused[:, 0:1]  # (B,1)
 
         # ---- Step 2: predict other properties conditioned on Z ----
-        x2 = torch.cat([x, z_pred], dim=1)  # (B, F+1)
-        p_fused, w_p, exps_p = self.head_props(x2)  # (B,To), ...
+        p_fused, w_p, exps_p = self.head_props(x)  # (B,To), ...  (NOT conditioned on Z as input)
 
         # ---- Reassemble fused in original target order ----
         B = x.shape[0]
@@ -382,6 +381,9 @@ class FusionModel(nn.Module):
         return {
             "fused": fused_all,
             "pred": fused_all,        # ✅ 兼容旧 trainer
+            "z_pred": z_pred,
+            "props_pred": p_fused,
+
             "experts": exps_all,      # ✅ 兼容旧 trainer：需要 (B,4,T)
             "gate_w": {"z": w_z, "props": w_p},
             "expert_outputs": {"z": exps_z, "props": exps_p, "all": exps_all},
