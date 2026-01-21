@@ -524,15 +524,15 @@ def load_from_checkpoint(config_path: str, save_dir: str, split: str = "test") -
     import torch
     from torch.utils.data import DataLoader, random_split
     from models.fusion_model import FusionModel
-    from utils.dataset import ZDataset
+    from utils.dataset import make_dataset
 
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
-    dataset = ZDataset(
-        csv_path=cfg['paths']['data'],
-        scaler_path=cfg['paths']['scaler'],
-        cfg=cfg,
+    dataset = make_dataset(
+        cfg['paths']['data'],
+        cfg,
+        scaler_path=cfg['paths'].get('scaler', None),
         train=False,
     )
 

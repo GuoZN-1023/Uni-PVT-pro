@@ -24,6 +24,121 @@ import numpy as np
 import pandas as pd
 
 
+def _augment_df_compat_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Add non-destructive alias/derived columns for compatibility.
+
+    - Add unit-annotated aliases for compact columns (e.g. Z -> 'Z (-)').
+    - Add compact aliases for unit-annotated columns (e.g. 'T_r (-)' -> T_r).
+    - Derive absolute state columns when possible:
+        (T_r, T_c) -> 'T (K)'
+        (p_r, p_c) -> 'P (Pa)' and 'P (MPa)'
+
+    This makes downstream training configs more robust when column naming differs
+    across preprocessing pipelines.
+    """
+    df = df.copy()
+
+    # Compact <-> unit-annotated aliases (reduced properties)
+    alias_pairs = [
+        ("T_r", "T_r (-)"),
+        ("p_r", "p_r (-)"),
+        ("omega", "omega (-)"),
+        ("T_c", "T_c (K)"),
+        ("p_c", "p_c (Pa)"),
+        ("mu", "mu ((J*m^3/kmol)^0.5)"),
+        ("Z", "Z (-)"),
+        ("phi", "phi (-)"),
+        ("lnphi", "lnphi (-)"),
+        ("H", "H (J/mol)"),
+        ("S", "S (J/mol/K)"),
+        ("T", "T (K)"),
+        ("P", "P (Pa)"),
+    ]
+    for a, b in alias_pairs:
+        if a in df.columns and b not in df.columns:
+            df[b] = df[a]
+        if b in df.columns and a not in df.columns:
+            df[a] = df[b]
+
+    # Derive absolute state if possible
+    if "T (K)" not in df.columns:
+        if "T_r" in df.columns and "T_c" in df.columns:
+            df["T (K)"] = pd.to_numeric(df["T_r"], errors="coerce") * pd.to_numeric(df["T_c"], errors="coerce")
+        elif "T_r (-)" in df.columns and "T_c (K)" in df.columns:
+            df["T (K)"] = pd.to_numeric(df["T_r (-)"], errors="coerce") * pd.to_numeric(df["T_c (K)"], errors="coerce")
+
+    if ("P (Pa)" not in df.columns or "P (MPa)" not in df.columns):
+        P_pa = None
+        if "p_r" in df.columns and "p_c" in df.columns:
+            P_pa = pd.to_numeric(df["p_r"], errors="coerce") * pd.to_numeric(df["p_c"], errors="coerce")
+        elif "p_r (-)" in df.columns and "p_c (Pa)" in df.columns:
+            P_pa = pd.to_numeric(df["p_r (-)"], errors="coerce") * pd.to_numeric(df["p_c (Pa)"], errors="coerce")
+        if P_pa is not None:
+            if "P (Pa)" not in df.columns:
+                df["P (Pa)"] = P_pa
+            if "P (MPa)" not in df.columns:
+                df["P (MPa)"] = P_pa / 1.0e6
+
+    # lnphi: derive from phi if needed
+    if "lnphi (-)" not in df.columns:
+        if "lnphi" in df.columns:
+            df["lnphi (-)"] = df["lnphi"]
+        elif "phi" in df.columns:
+            phi = pd.to_numeric(df["phi"], errors="coerce")
+            df["lnphi (-)"] = np.log(np.clip(phi, 1.0e-12, None))
+        elif "phi (-)" in df.columns:
+            phi = pd.to_numeric(df["phi (-)"], errors="coerce")
+            df["lnphi (-)"] = np.log(np.clip(phi, 1.0e-12, None))
+
+    return df
+
+
+def _save_npz_table(df: pd.DataFrame, out_npz: Path) -> None:
+    """Save a DataFrame as a compact NPZ that still supports flexible column selection.
+
+    Format:
+      - data: float32 matrix for all numeric columns (N, M)
+      - __cols__: object array of numeric column names (M,)
+      - obj__<col>: string array for each non-numeric column
+
+    This allows training-time selection by column name without requiring CSV.
+    """
+    df = df.copy()
+
+    # Normalize/augment columns so both compact and unit-annotated configs work.
+    df = _augment_df_compat_names(df)
+
+    # Keep numeric columns in a single matrix.
+    num_df = df.select_dtypes(include=[np.number]).copy()
+    # Coerce remaining numeric-looking cols (common when CSV is mixed dtype)
+    for c in df.columns:
+        if c in num_df.columns:
+            continue
+        # attempt numeric conversion if it looks like numbers with occasional strings
+        if df[c].dtype == object:
+            as_num = pd.to_numeric(df[c], errors="coerce")
+            # treat as numeric if conversion yields mostly non-NaN
+            if as_num.notna().mean() > 0.9:
+                num_df[c] = as_num
+
+    num_cols = list(num_df.columns)
+    data = num_df.to_numpy(dtype=np.float32, copy=True)
+
+    payload = {
+        "data": data,
+        "__cols__": np.asarray(num_cols, dtype=object),
+    }
+
+    # Store non-numeric columns separately (strings/ids).
+    for c in df.columns:
+        if c in num_cols:
+            continue
+        payload[f"obj__{c}"] = np.asarray(df[c].astype(str).fillna(""), dtype=object)
+
+    out_npz.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_npz, **payload)
+
+
 def _allocate_counts(total: int, weights: np.ndarray) -> np.ndarray:
     """Allocate integer counts that sum to `total`, proportional to `weights`."""
     total = int(total)
@@ -178,6 +293,8 @@ def main() -> None:
     ap.add_argument("--test_ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--outdir", type=str, required=True)
+    ap.add_argument("--export_npz", action="store_true", help="Also export train/val/test as .npz (and keep only npz if --delete_csv)")
+    ap.add_argument("--delete_csv", action="store_true", help="Delete train/val/test.csv after exporting .npz")
     args = ap.parse_args()
 
     mol_dir = Path(args.molecules_dir)
@@ -245,13 +362,38 @@ def main() -> None:
     val_df.to_csv(val_path, index=False)
     test_df.to_csv(test_path, index=False)
 
+    # Optional: export compact npz versions so training can run without CSV.
+    if bool(args.export_npz):
+        train_npz = outdir / "train.npz"
+        val_npz = outdir / "val.npz"
+        test_npz = outdir / "test.npz"
+        _save_npz_table(train_df, train_npz)
+        _save_npz_table(val_df, val_npz)
+        _save_npz_table(test_df, test_npz)
+        print(f"  train(npz): {train_npz}")
+        print(f"  val  (npz): {val_npz}")
+        print(f"  test (npz): {test_npz}")
+
+        if bool(args.delete_csv):
+            for p in [train_path, val_path, test_path]:
+                try:
+                    p.unlink(missing_ok=True)
+                except TypeError:
+                    # py<3.8 compat
+                    if p.exists():
+                        p.unlink()
+            print("  deleted train/val/test.csv")
+
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
 
     print("[prepare_dataset] saved")
-    print(f"  train: {train_path} ({len(train_df)})")
-    print(f"  val  : {val_path} ({len(val_df)})")
-    print(f"  test : {test_path} ({len(test_df)})")
+    if train_path.exists():
+        print(f"  train: {train_path} ({len(train_df)})")
+    if val_path.exists():
+        print(f"  val  : {val_path} ({len(val_df)})")
+    if test_path.exists():
+        print(f"  test : {test_path} ({len(test_df)})")
     print(f"  manifest: {manifest_path}")
 
 

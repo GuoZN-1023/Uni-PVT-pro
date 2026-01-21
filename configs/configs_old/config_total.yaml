@@ -1,0 +1,283 @@
+# =========================
+# Uni-PVT Training Config (Full)
+# Multi-target + MoE + PINN Thermo Constraints
+# Outputs: Clean 6 CSV exports + keep plots (no extra raw CSV)
+# =========================
+
+# ---- Data & I/O ----
+paths:
+  data: /home/thermo2025/Uni-PVT-Data-20260115-v1.0  #用新数据请创建新目录存放数据，命名为Uni-PVT-Data-20260115-v1.0之类
+  # run_all 通常会把每次实验写到 results/<timestamp>/ 下
+  # 这里作为默认兜底
+  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest # 每个人在results里给自己创建一个新的results目录，自己跑的结果放到自己的目录下，命名为results_gzn_20250115之类的
+  scaler: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/scaler.pkl
+  
+  # 明确指定 train/val/test 数据路径，导出数据需要
+  train_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/train.csv
+  val_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/val.csv
+  test_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/test.csv
+
+data:
+  split:
+    train_ratio: 0.80
+    val_ratio: 0.10
+    test_ratio: 0.10
+
+  sampling:
+    enabled: true
+    total_rows: 100000
+    pattern: "*.csv"       # 需要的话也可以写成 "mol_*.csv"
+
+  split:
+    train_ratio: 0.80
+    val_ratio: 0.10
+    test_ratio: 0.10
+    shuffle: true
+    seed: 42
+
+  # 加速用（CUDA 下有效）
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+
+  # 可选：只用部分数据做快速调试
+  limit_rows: 100000   # e.g. 20000
+
+# 相区编号列（必须存在）
+expert_col: "no"
+
+# ---- Columns ----
+feature_cols:
+  - "T_r (-)"
+  - "p_r (-)"
+  - "omega (-)"
+  - "p_c (Pa)"
+  - "T_c (K)"
+  - "mu ((J*m^3/kmol)^0.5)"
+
+targets:
+  - "Z (-)"
+  # - "phi (-)"
+  # - "H (J/mol)"
+  - "S (J/mol/K)"
+
+# ---- Model: Mixture-of-Experts ----
+experts:
+  gas:
+    hidden_layers: [512, 256, 128, 64]
+    activation: gelu
+    dropout: 0.0
+  liquid:
+    hidden_layers: [512, 256, 128, 64]
+    activation: gelu
+    dropout: 0.0
+  critical:
+    hidden_layers: [512, 256, 128, 64]
+    activation: gelu
+    dropout: 0.0
+  extra:
+    hidden_layers: [512, 256, 128]
+    activation: gelu
+    dropout: 0.0
+
+gate:
+  hidden_layers: [512, 256, 128, 64]
+  activation: relu
+  dropout: 0.05
+
+model:
+  # input_dim / output_dim 会由 feature_cols 与 targets 自动推断
+  input_dim: 8
+  output_dim: 4
+
+# ---- Runtime / speed options ----
+runtime:
+  device: auto          # auto | cuda | mps | cpu
+  amp:
+    enabled: true       # CUDA 时建议 true
+  tf32:
+    enabled: true       # CUDA 时建议 true（A100/30系/40系收益明显）
+  compile:
+    enabled: false      # torch.compile，若模型动态图多可先关
+
+# ---- Training Strategy (3-stage) ----
+training:
+  seed: 42
+  batch_size: 512
+  gradient_clip_norm: 0.0      # 0 表示不裁剪；不稳定时可设 1.0 或 5.0
+
+  # Optimizer base LR（阶段内 scheduler 会随 epoch 变化）
+  learning_rate: 0.0005
+  weight_decay: 0.0
+
+  optimizer:
+    name: adamw             # adam | adamw
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  # 学习率调度器（按 epoch 变化）
+  lr_scheduler:
+    enabled: true
+    name: cosine             # cosine | step | exp | plateau | none
+    warmup_epochs: 5
+    warmup_start_factor: 0.2
+    min_lr: 1.0e-5
+    # step 用到
+    step_size: 20
+    # exp 用到
+    gamma: 0.5
+    # plateau 用到
+    plateau:
+      mode: min
+      factor: 0.5
+      patience: 8
+      threshold: 0.0
+      min_lr: 1.0e-6
+
+  # Stage-1: 只预训练专家（hard routing by no）
+  pretrain_epochs: 50
+
+  # Stage-2: 冻结专家，只训练 gate
+  gate_epochs: 50
+
+  # Stage-3: 联合微调
+  finetune:
+    enabled: true
+    epochs: 80
+    unfreeze: ["gas", "liquid", "critical", "extra"]
+    learning_rate: 0.0007          # 微调阶段起始 lr（之后仍会按 scheduler 衰减）
+    min_lr: 5.0e-6                 # 可覆盖全局 min_lr（不填则用 training.lr_scheduler.min_lr）
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
+    monitor: val_loss             # val_loss | val_data_loss
+
+  # Gate temperature（让权重从更软到更硬）
+  gate_temperature_schedule:
+    enabled: true
+    start: 1.5
+    end: 0.8
+
+  # 评估频率（减少频繁验证能明显提速）
+  eval:
+    eval_every_epochs: 1
+    log_every_steps: 50
+
+# ---- Loss: Supervised + Regularizers ----
+loss:
+  supervised: "mse"          # mse | huber
+  huber_delta: 1.0
+
+  # 多目标/多量纲：监督损失按每个 target 的 std 归一化（强烈建议开）
+  target_normalize:
+    enabled: true
+    mode: "per_target_std"   # per_target_std
+    eps: 1.0e-12
+
+  # 按 no 的区域权重
+  region_weights:
+    enabled: true
+    weights: {1: 1.0, 2: 1.5, 3: 2.0, 4: 1.0}
+
+  # 你原有的项
+  lambda_nonneg: 3.08e-05
+  lambda_smooth: 0.0
+
+  # 极端区域（例如 Z≈1）的额外权重
+  lambda_extreme: 1.0
+  extreme_alpha: 4.0
+
+  # 相对误差项（保持关）
+  lambda_relative: 0.0
+
+  # gate 熵正则
+  lambda_entropy: -0.01
+
+# ---- PINN Thermodynamics Constraints ----
+pinn:
+  enabled: true
+  input_mode: reduced     # reduced | absolute
+
+  # 目标列名映射（必须与 targets 一致）
+  z_name: "Z (-)"
+  # phi_name: "phi (-)"
+  # h_name: "H (J/mol)"
+  s_name: "S (J/mol/K)"
+
+  # 从 feature_cols 中挑出 P 与 T 的列名（必须存在）
+  pr_feature: "p_r (-)"
+  tr_feature: "T_r (-)"
+  pc_feature: "p_c (Pa)"
+  tc_feature: "T_c (K)"
+
+  # 单位换算：把 p_feature 的数值转成 Pa
+  # 注意：如果 p_r 是 reduced pressure，本质上是无量纲，严格说不能乘 1e6 变 Pa
+  # 这里按你目前的设定保留；若后面物理残差异常大/不收敛，再把这一项理顺
+  p_to_Pa: 1.0
+
+  R: 8.31446261815324 
+
+  # PINN 残差权重
+  lambda_phi: 0.0005
+  lambda_H: 0.0005
+  lambda_S: 0.0005
+
+  schedule:
+    apply_in_pretrain: true
+    apply_in_gate_train: true
+    apply_in_finetune: true
+
+  # PINN 抽稀（提速且更稳）：每 k 个 step 才计算一次 PINN（1 表示每步都算）
+  compute_every_steps: 1
+
+# ---- Visualization (keep plots, avoid extra raw csv) ----
+pt_viz:
+  enabled: true
+  diff_mode: pred_minus_true
+  # 多目标时 run_all/pt_viz 会用 --target 逐个生成 dashboard
+  per_target: true
+  allow_fail: true
+
+# ---- SHAP Explainability ----
+shap:
+  enabled: true
+  max_samples: 2000
+  # 你说“不关心原始数据表，只要看图”，所以默认不落 SHAP csv
+  save_csv: false
+
+# ---- Exports: ONLY 6 CSV ----
+exports:
+  enabled: true
+  outdir_name: exports
+
+  # 只输出这 6 个文件（固定命名）
+  files:
+    pretrain_best_predictions: "pretrain_best_predictions.csv"
+    pretrain_best_metrics: "pretrain_best_metrics.csv"
+    gate_test_predictions: "gate_test_predictions.csv"
+    gate_test_metrics: "gate_test_metrics.csv"
+    finetune_test_predictions: "finetune_test_predictions.csv"
+    finetune_test_metrics: "finetune_test_metrics.csv"
+
+  # predictions 表里保留哪些列
+  predictions_keep:
+    keep_features: true      # true: 保留 feature_cols；false: 只保留 no + y_true/y_pred
+    keep_expert_col: true
+
+  # 强制清理其它散落的 csv（不影响画图，因为画图从 exports 读）
+  cleanup_other_csv: true
+  cleanup_allowlist_dirs:
+    - exports
+
+# ---- Optuna (Multi-objective) ----
+optuna:
+  enabled: false
+  n_trials: 50
+  sampler: "tpe"
+  directions: ["minimize", "minimize", "minimize"]
+  study_name: "uni_pvt_mo"
+  storage: null
+  search_space: {}

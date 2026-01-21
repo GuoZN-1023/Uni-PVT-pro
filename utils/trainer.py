@@ -106,6 +106,19 @@ def _unwrap_dataset(loader) -> Any:
     return getattr(loader, "dataset", None)
 
 
+def _maybe_set_epoch(loader, epoch: int) -> None:
+    """DDP helper: if the loader uses a DistributedSampler, set its epoch.
+
+    Without this, every epoch will see the same shuffle order on each rank.
+    """
+    try:
+        sampler = getattr(loader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(int(epoch))
+    except Exception:
+        pass
+
+
 def _gate_and_expert_params(model) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     """
     Returns:
@@ -428,7 +441,6 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
         target_cols=target_cols_in_ds,
         scaler_mean=scaler_mean,
         scaler_scale=scaler_scale,
-        device=device,
     )
 
     training = cfg.get("training", {}) or {}
@@ -504,6 +516,7 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
 
         for epoch in range(pretrain_epochs):
             model.train()
+            _maybe_set_epoch(train_loader, epoch)
             running = 0.0
             n_batches = 0
 
@@ -580,6 +593,7 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
 
         for epoch in range(stage2_epochs):
             model.train()
+            _maybe_set_epoch(train_loader, epoch)
             running_sum = 0.0
             running_n = 0.0
 
@@ -682,6 +696,7 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
 
         for epoch in range(finetune_epochs):
             model.train()
+            _maybe_set_epoch(train_loader, epoch)
             running_sum = 0.0
             running_n = 0.0
 

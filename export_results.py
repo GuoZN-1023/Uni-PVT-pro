@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from utils.dataset import ZDataset, MolCachedZDataset
+from utils.dataset import make_dataset
 from models.fusion_model import FusionModel
 
 
@@ -231,8 +231,7 @@ def main():
         raise ValueError("config missing paths.scaler")
 
     # Build dataset in inference mode
-    ds = (MolCachedZDataset(csv_path=data_path, cfg=cfg) if mol_enabled
-          else ZDataset(csv_path=data_path, scaler_path=scaler_path, cfg=cfg, train=False))
+    ds = make_dataset(data_path, cfg, scaler_path=scaler_path, train=False)
 
     target_cols = list(ds.target_cols)
     expert_col = ds.expert_col

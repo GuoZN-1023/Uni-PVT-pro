@@ -13,6 +13,147 @@ from .mol_cache import MolCache
 import time
 
 
+def _is_npz(path: str) -> bool:
+    return str(path).lower().endswith(".npz")
+
+
+class _NPZTable:
+    """Lightweight column-addressable table loaded from a single .npz.
+
+    The .npz is produced by prepare_dataset.py::_save_npz_table.
+
+    Keys:
+      - data: float32 matrix of numeric columns (N,M)
+      - __cols__: column names for numeric matrix
+      - obj__<col>: optional object/string arrays for non-numeric cols
+    """
+
+    def __init__(self, npz_path: str):
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"NPZ not found: {npz_path}")
+        self.npz_path = npz_path
+        self._npz = np.load(npz_path, allow_pickle=True)
+        self.num_cols = [str(x) for x in self._npz["__cols__"].tolist()]
+        self.data = self._npz["data"]
+        # collect object columns
+        self.obj = {}
+        for k in self._npz.files:
+            if k.startswith("obj__"):
+                self.obj[k[len("obj__"):]] = self._npz[k]
+
+    @property
+    def columns(self) -> list[str]:
+        return list(self.num_cols) + list(self.obj.keys())
+
+    def has(self, col: str) -> bool:
+        return (col in self.num_cols) or (col in self.obj)
+
+    def get_numeric(self, col: str) -> np.ndarray:
+        if col not in self.num_cols:
+            raise KeyError(f"Column '{col}' is not numeric in NPZ: {self.npz_path}")
+        j = self.num_cols.index(col)
+        return self.data[:, j]
+
+    def get_object(self, col: str) -> np.ndarray:
+        if col not in self.obj:
+            raise KeyError(f"Column '{col}' not found in NPZ object columns: {self.npz_path}")
+        return self.obj[col]
+
+
+def _apply_subset_np(
+    n_rows: int,
+    expert_ids: np.ndarray,
+    subset_cfg: dict | None,
+    seed: int = 42,
+) -> np.ndarray:
+    """Subset selection on numpy arrays (NPZ mode).
+
+    Matches apply_subset(df, ...) semantics.
+    """
+    if not subset_cfg or not subset_cfg.get("enabled", False):
+        return np.arange(n_rows, dtype=np.int64)
+
+    idx = np.arange(n_rows, dtype=np.int64)
+    mask = np.ones(n_rows, dtype=bool)
+
+    inc = subset_cfg.get("include_expert_ids", None)
+    exc = subset_cfg.get("exclude_expert_ids", None)
+    if inc is not None:
+        inc = set(int(x) for x in inc)
+        mask &= np.isin(expert_ids.astype(int), np.array(sorted(list(inc)), dtype=int))
+    if exc is not None:
+        exc = set(int(x) for x in exc)
+        mask &= ~np.isin(expert_ids.astype(int), np.array(sorted(list(exc)), dtype=int))
+
+    idx = idx[mask]
+
+    rng = np.random.default_rng(int(seed))
+    frac = subset_cfg.get("fraction", None)
+    if frac is not None:
+        frac = float(frac)
+        frac = max(min(frac, 1.0), 0.0)
+        if 0.0 < frac < 1.0 and len(idx) > 0:
+            k = int(max(1, round(frac * len(idx))))
+            idx = rng.choice(idx, size=k, replace=False)
+
+    max_samples = subset_cfg.get("max_samples", None)
+    if max_samples is not None:
+        max_samples = int(max_samples)
+        if max_samples > 0 and len(idx) > max_samples:
+            idx = rng.choice(idx, size=max_samples, replace=False)
+
+    # keep deterministic order for reproducibility
+    return np.sort(idx.astype(np.int64))
+
+
+def _augment_df_compat(df: pd.DataFrame) -> pd.DataFrame:
+    """Augment dataframe with compatibility aliases/derived columns.
+
+    This project historically used unit-annotated column names like
+    'Z (-)', 'T (K)', 'P (MPa)', 'lnphi (-)'.
+    Many newer pipelines export compact names like 'Z', 'phi', 'T_r', 'p_r', etc.
+
+    We add *non-destructive* aliases so both conventions work:
+      - Z -> 'Z (-)'
+      - phi -> 'lnphi (-)' (computed as log(phi))
+      - H -> 'H (J/mol)'
+      - S -> 'S (J/mol/K)'
+      - (T_r, T_c) -> 'T (K)'
+      - (p_r, p_c) -> 'P (Pa)' and 'P (MPa)'
+    """
+    df = df.copy()
+
+    # --- derived absolute state from reduced quantities ---
+    if "T (K)" not in df.columns and "T_r" in df.columns and "T_c" in df.columns:
+        df["T (K)"] = pd.to_numeric(df["T_r"], errors="coerce") * pd.to_numeric(df["T_c"], errors="coerce")
+
+    if ("P (Pa)" not in df.columns or "P (MPa)" not in df.columns) and "p_r" in df.columns and "p_c" in df.columns:
+        P_pa = pd.to_numeric(df["p_r"], errors="coerce") * pd.to_numeric(df["p_c"], errors="coerce")
+        if "P (Pa)" not in df.columns:
+            df["P (Pa)"] = P_pa
+        if "P (MPa)" not in df.columns:
+            df["P (MPa)"] = P_pa / 1.0e6
+
+    # --- common alias columns ---
+    if "Z (-)" not in df.columns and "Z" in df.columns:
+        df["Z (-)"] = df["Z"]
+    if "H (J/mol)" not in df.columns and "H" in df.columns:
+        df["H (J/mol)"] = df["H"]
+    if "S (J/mol/K)" not in df.columns and "S" in df.columns:
+        df["S (J/mol/K)"] = df["S"]
+
+    # lnphi: compute from phi if needed
+    if "lnphi (-)" not in df.columns:
+        if "lnphi" in df.columns:
+            df["lnphi (-)"] = df["lnphi"]
+        elif "phi" in df.columns:
+            phi = pd.to_numeric(df["phi"], errors="coerce")
+            # phi should be positive; clip for numerical safety
+            df["lnphi (-)"] = np.log(np.clip(phi, 1.0e-12, None))
+
+    return df
+
+
 def _atomic_joblib_dump(obj, path: str):
     """Write joblib file atomically to avoid partial-file reads in multi-process launches."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -174,10 +315,14 @@ def resolve_columns_from_config(
             return None
         if isinstance(v, str):
             v_strip = v.strip()
+            # keep sentinel strings
+            if v_strip.lower() in ("all", "*"):
+                return v_strip
             # allow "a,b,c"
-            if "," in v_strip and v_strip.lower() not in ("all", "*"):
+            if "," in v_strip:
                 return [s.strip() for s in v_strip.split(",") if s.strip()]
-            return v_strip
+            # IMPORTANT: always return a list for normal strings
+            return [v_strip]
         if isinstance(v, (list, tuple)):
             return [str(x).strip() for x in v if str(x).strip()]
         return v
@@ -333,6 +478,9 @@ class ZDataset(Dataset):
         expert_col = cfg.get("expert_col", "no")
 
         df_raw = pd.read_csv(csv_path)
+        # Compatibility: add derived/alias columns (e.g., Z -> 'Z (-)', phi -> 'lnphi (-)',
+        # (T_r,T_c)->'T (K)', (p_r,p_c)->'P (MPa)') so different data conventions work.
+        df_raw = _augment_df_compat(df_raw)
 
         # ---- Optional: shrink dataset size from YAML (fast debugging / ablations) ----
         # data.limit_rows: int or null
@@ -457,6 +605,214 @@ class ZDataset(Dataset):
         return x, y, expert_id
 
 
+class NPZDataset(Dataset):
+    """CSV-free dataset that loads from a single .npz.
+
+    It preserves the same feature/target selection logic as ZDataset, but the
+    raw table is stored in a compact npz produced by prepare_dataset.py.
+
+    The scaler is still fit/loaded identically using cfg and scaler_path.
+    """
+
+    def __init__(self, npz_path: str, scaler_path: str, cfg: dict, train: bool = True):
+        super().__init__()
+        self.cfg = cfg
+        self.npz_path = npz_path
+        self.scaler_path = scaler_path
+        self.train = bool(train)
+
+        table = _NPZTable(npz_path)
+        cols = table.columns
+
+        # Selection logic shared with CSV mode
+        anchor_col = cfg.get("anchor_col", cfg.get("target_anchor_col", cfg.get("target_col", "Z (-)")))
+        expert_col = cfg.get("expert_col", "no")
+
+        feature_cols_raw, chosen_targets, expert_col = resolve_columns_from_config(cols, cfg=cfg)
+        try:
+            _, target_candidates_raw = infer_feature_and_target_cols(cols, anchor_col=_get_cfg(cfg, "anchor_col", "Z (-)"), expert_col=expert_col)
+        except Exception:
+            target_candidates_raw = list(chosen_targets)
+
+        needed_cols = list(feature_cols_raw) + list(chosen_targets) + [expert_col]
+        for c in needed_cols:
+            if not table.has(c):
+                raise ValueError(f"[NPZDataset] Required column '{c}' not found in {npz_path}")
+
+        # Build raw arrays
+        X_raw = np.stack([table.get_numeric(c) for c in feature_cols_raw], axis=1).astype(np.float32)
+        y_raw = np.stack([table.get_numeric(c) for c in chosen_targets], axis=1).astype(np.float32)
+        expert_ids = table.get_numeric(expert_col).astype(np.int64)
+
+        # Drop rows with NaNs in required columns
+        mask = np.isfinite(X_raw).all(axis=1) & np.isfinite(y_raw).all(axis=1) & np.isfinite(expert_ids)
+        idx = np.where(mask)[0].astype(np.int64)
+        dropped = int(len(mask) - int(mask.sum()))
+        if dropped > 0:
+            print(f"[NPZDataset] Dropped {dropped} rows due to NaNs in required columns.")
+
+        X_raw = X_raw[idx]
+        y = y_raw[idx]
+        expert_ids = expert_ids[idx]
+
+        # Optional subset
+        subset_cfg = cfg.get("subset", None)
+        seed = int(((cfg.get("training", {}) or {}).get("seed", 42)))
+        sub_idx = _apply_subset_np(len(X_raw), expert_ids, subset_cfg=subset_cfg, seed=seed)
+        X_raw = X_raw[sub_idx]
+        y = y[sub_idx]
+        expert_ids = expert_ids[sub_idx]
+
+        # For exports/debug: keep a minimal numeric dataframe + optional meta cols
+        meta_cols = _get_cfg(cfg, "meta_cols", None)
+        if meta_cols is None:
+            meta_cols = (cfg.get("data", {}) or {}).get("meta_cols", ["molecule_id", "mol_id"])
+        if isinstance(meta_cols, str):
+            meta_cols = [meta_cols]
+
+        num_df = pd.DataFrame({c: table.get_numeric(c)[idx][sub_idx] for c in table.num_cols})
+        for mc in meta_cols or []:
+            if mc in table.obj:
+                num_df[mc] = table.get_object(mc)[idx][sub_idx]
+        self.num_df = num_df
+
+        self.anchor_col = anchor_col
+        self.expert_col = expert_col
+        self.feature_cols = list(feature_cols_raw)
+        self.all_target_cols = list(target_candidates_raw)
+        self.target_cols = list(chosen_targets)
+
+        self.feature_df = pd.DataFrame(X_raw, columns=self.feature_cols)
+
+        # scaler
+        if self.train:
+            scaler = StandardScaler()
+            Xs = scaler.fit_transform(X_raw)
+            os.makedirs(os.path.dirname(self.scaler_path), exist_ok=True)
+            _atomic_joblib_dump(scaler, self.scaler_path)
+        else:
+            if not os.path.exists(self.scaler_path):
+                raise FileNotFoundError(f"Scaler not found: {self.scaler_path} (run train first?)")
+            scaler = _retry_joblib_load(self.scaler_path)
+            Xs = scaler.transform(X_raw)
+
+        self.scaler_mean = np.asarray(getattr(scaler, 'mean_', np.zeros(X_raw.shape[1])), dtype=np.float32)
+        self.scaler_scale = np.asarray(getattr(scaler, 'scale_', np.ones(X_raw.shape[1])), dtype=np.float32)
+        self.X = Xs.astype(np.float32)
+        self.y = y.astype(np.float32)
+        self.expert_ids = expert_ids.astype(np.int64)
+        self.input_dim = int(self.X.shape[1])
+        self.output_dim = int(self.y.shape[1])
+
+    def __len__(self):
+        return int(len(self.X))
+
+    def __getitem__(self, idx: int):
+        return (
+            torch.tensor(self.X[idx], dtype=torch.float32),
+            torch.tensor(self.y[idx], dtype=torch.float32),
+            torch.tensor(self.expert_ids[idx], dtype=torch.long),
+        )
+
+
+class MolCachedNPZDataset(Dataset):
+    """Mol-cache dataset that reads per-sample metadata from .npz instead of CSV."""
+
+    def __init__(self, *, npz_path: str, cfg: dict):
+        super().__init__()
+        self.cfg = cfg
+        mcfg = (cfg.get("mol_encoder") or {})
+        if not bool(mcfg.get("enabled", False)):
+            raise ValueError("MolCachedNPZDataset requires cfg.mol_encoder.enabled: true")
+
+        cache_cfg = (mcfg.get("cache") or {})
+        self.cache = MolCache(
+            z_conf_path=str(cache_cfg.get("z_conf_path")),
+            e_conf_path=str(cache_cfg.get("e_conf_path")),
+            meta_path=cache_cfg.get("meta_path", None),
+            id_map_path=cache_cfg.get("id_map_path", None),
+        )
+
+        self.mol_id_col = str(mcfg.get("mol_id_col", "mol_id"))
+        self.state_cols = list(mcfg.get("state_cols", ["T (K)", "P (Pa)"]))
+        if len(self.state_cols) != 2:
+            raise ValueError(f"mol_encoder.state_cols must be length-2 [T_col, P_col], got {self.state_cols}")
+        self.expert_col = str(cfg.get("expert_col", "no"))
+
+        table = _NPZTable(npz_path)
+        cols = table.columns
+        if self.mol_id_col not in cols:
+            raise ValueError(f"MolCachedNPZDataset missing mol_id_col={self.mol_id_col} in NPZ columns")
+        for c in self.state_cols:
+            if c not in cols:
+                raise ValueError(f"MolCachedNPZDataset missing state col '{c}' in NPZ columns")
+        if self.expert_col not in cols:
+            raise ValueError(f"MolCachedNPZDataset missing expert_col '{self.expert_col}' in NPZ columns")
+
+        # targets: same rule as MolCachedZDataset
+        anchor_col = str(cfg.get("anchor_col", "Z (-)"))
+        if isinstance(cfg.get("targets", None), list) and len(cfg["targets"]) > 0:
+            target_cols = list(cfg["targets"])
+        else:
+            if anchor_col not in cols:
+                raise ValueError(f"MolCachedNPZDataset missing anchor_col '{anchor_col}' in NPZ; set cfg.targets explicitly.")
+            a = list(cols).index(anchor_col)
+            b = list(cols).index(self.expert_col)
+            if b <= a:
+                raise ValueError(f"Invalid columns order: anchor_col '{anchor_col}' must appear before expert_col '{self.expert_col}'.")
+            target_cols = list(cols)[a:b]
+
+        self.target_cols = target_cols
+        self.output_dim = int(len(self.target_cols))
+
+        # mol_id may be stored as object or numeric
+        if self.mol_id_col in table.obj:
+            mol_ids = table.get_object(self.mol_id_col)
+        else:
+            mol_ids = table.get_numeric(self.mol_id_col)
+        self.mol_ids = [str(x) for x in mol_ids.tolist()]
+        self.state_tp = np.stack([table.get_numeric(self.state_cols[0]), table.get_numeric(self.state_cols[1])], axis=1).astype(np.float32)
+        self.expert_ids = table.get_numeric(self.expert_col).astype(np.int64)
+        self.y = np.stack([table.get_numeric(c) for c in self.target_cols], axis=1).astype(np.float32)
+
+        # drop NaNs
+        mask = np.isfinite(self.state_tp).all(axis=1) & np.isfinite(self.expert_ids) & np.isfinite(self.y).all(axis=1)
+        idx = np.where(mask)[0].astype(np.int64)
+        if len(idx) != len(self.mol_ids):
+            print(f"[MolCachedNPZDataset] Dropped {len(self.mol_ids) - len(idx)} rows due to NaNs.")
+        self.mol_ids = [self.mol_ids[i] for i in idx]
+        self.state_tp = self.state_tp[idx]
+        self.expert_ids = self.expert_ids[idx]
+        self.y = self.y[idx]
+
+        self.input_dim = int(self.cache.embed_dim)
+        self.feature_cols = list(self.state_cols)
+        self.scaler = None
+        self.scaler_mean = None
+        self.scaler_scale = None
+        # Minimal num_df for exports
+        self.num_df = pd.DataFrame({
+            self.state_cols[0]: self.state_tp[:, 0],
+            self.state_cols[1]: self.state_tp[:, 1],
+            self.expert_col: self.expert_ids,
+        })
+
+    def __len__(self):
+        return int(len(self.mol_ids))
+
+    def __getitem__(self, idx: int):
+        mol_id = self.mol_ids[idx]
+        z_conf, e_conf = self.cache.get(mol_id)
+        return {
+            "mol_id": mol_id,
+            "z_conf": torch.from_numpy(z_conf.astype(np.float32)),
+            "e_conf": torch.from_numpy(e_conf.astype(np.float32)),
+            "state": torch.from_numpy(self.state_tp[idx]),
+            "y": torch.from_numpy(self.y[idx]),
+            "expert_id": torch.tensor(self.expert_ids[idx], dtype=torch.long),
+        }
+
+
 class MolCachedZDataset(Dataset):
     """Uni-PVT 2.0 dataset: load *cached* molecular encodings + physical state.
 
@@ -503,7 +859,7 @@ class MolCachedZDataset(Dataset):
         self.expert_col = str(cfg.get("expert_col", "no"))
 
         # target selection is identical to legacy
-        df = pd.read_csv(csv_path)
+        df = _augment_df_compat(pd.read_csv(csv_path))
         if self.mol_id_col not in df.columns:
             raise ValueError(f"MolCachedZDataset missing mol_id_col={self.mol_id_col} in CSV columns")
         for c in self.state_cols:
@@ -572,6 +928,17 @@ def get_dataloaders(cfg: dict):
 
     mol_enabled = bool((cfg.get("mol_encoder") or {}).get("enabled", False))
 
+    def _make_dataset(path: str, *, train_flag: bool):
+        """Create the right dataset class for CSV/NPZ and legacy/mol-cache mode."""
+        if _is_npz(path):
+            if mol_enabled:
+                return MolCachedNPZDataset(npz_path=path, cfg=cfg)
+            return NPZDataset(npz_path=path, scaler_path=scaler_path, cfg=cfg, train=train_flag)
+        else:
+            if mol_enabled:
+                return MolCachedZDataset(csv_path=path, cfg=cfg)
+            return ZDataset(csv_path=path, scaler_path=scaler_path, cfg=cfg, train=train_flag)
+
     # If explicit split CSVs exist, prefer them (for reproducible sampling pipelines).
     train_path = paths.get("train_data", None)
     val_path = paths.get("val_data", None)
@@ -597,14 +964,9 @@ def get_dataloaders(cfg: dict):
 
     if train_path and val_path and test_path:
         # Reproducible explicit splits.
-        if mol_enabled:
-            train_set = MolCachedZDataset(csv_path=train_path, cfg=cfg)
-            val_set = MolCachedZDataset(csv_path=val_path, cfg=cfg)
-            test_set = MolCachedZDataset(csv_path=test_path, cfg=cfg)
-        else:
-            train_set = ZDataset(csv_path=train_path, scaler_path=scaler_path, cfg=cfg, train=True)
-            val_set = ZDataset(csv_path=val_path, scaler_path=scaler_path, cfg=cfg, train=False)
-            test_set = ZDataset(csv_path=test_path, scaler_path=scaler_path, cfg=cfg, train=False)
+        train_set = _make_dataset(str(train_path), train_flag=True)
+        val_set = _make_dataset(str(val_path), train_flag=False)
+        test_set = _make_dataset(str(test_path), train_flag=False)
         full_dataset = train_set  # for scale stats below
         train_indices = None
     else:
@@ -616,15 +978,7 @@ def get_dataloaders(cfg: dict):
                 "so run_all can build train/val/test split files under results/<timestamp>/dataset/. "
                 "Otherwise, set paths.data to a single CSV file path."
             )
-        if mol_enabled:
-            full_dataset = MolCachedZDataset(csv_path=data_path, cfg=cfg)
-        else:
-            full_dataset = ZDataset(
-                csv_path=data_path,
-                scaler_path=scaler_path,
-                cfg=cfg,
-                train=True,
-            )
+        full_dataset = _make_dataset(str(data_path), train_flag=True)
 
         n_total = len(full_dataset)
         split_cfg = (cfg.get("data", {}) or {}).get("split", {}) if isinstance(cfg.get("data", None), dict) else {}
@@ -646,6 +1000,38 @@ def get_dataloaders(cfg: dict):
             full_dataset, [n_train, n_val, n_test], generator=g
         )
         train_indices = getattr(train_set, "indices", None)
+
+        # IMPORTANT: avoid scaler leakage in random-split mode.
+        # ZDataset(train=True) fits the scaler during construction, which would otherwise
+        # see *all* samples. Here we re-fit the scaler on TRAIN indices only and re-transform
+        # the whole dataset in-place so Subset(...) views remain valid.
+        if (not mol_enabled) and isinstance(full_dataset, ZDataset) and train_indices is not None:
+            import torch.distributed as dist
+
+            def _refit_and_rescale_on_rank0():
+                X_raw = full_dataset.feature_df.to_numpy(dtype=np.float32)
+                tr = np.asarray(train_indices, dtype=np.int64)
+                scaler = StandardScaler()
+                scaler.fit(X_raw[tr])
+                Xs_all = scaler.transform(X_raw).astype(np.float32)
+                full_dataset.X = Xs_all
+                full_dataset.scaler_mean = np.asarray(getattr(scaler, 'mean_', np.zeros(X_raw.shape[1])), dtype=np.float32)
+                full_dataset.scaler_scale = np.asarray(getattr(scaler, 'scale_', np.ones(X_raw.shape[1])), dtype=np.float32)
+                _atomic_joblib_dump(scaler, full_dataset.scaler_path)
+
+            if dist.is_available() and dist.is_initialized():
+                if dist.get_rank() == 0:
+                    _refit_and_rescale_on_rank0()
+                dist.barrier()
+                # non-rank0 processes load the scaler and apply transform
+                if dist.get_rank() != 0:
+                    scaler = _retry_joblib_load(full_dataset.scaler_path)
+                    X_raw = full_dataset.feature_df.to_numpy(dtype=np.float32)
+                    full_dataset.X = scaler.transform(X_raw).astype(np.float32)
+                    full_dataset.scaler_mean = np.asarray(getattr(scaler, 'mean_', np.zeros(X_raw.shape[1])), dtype=np.float32)
+                    full_dataset.scaler_scale = np.asarray(getattr(scaler, 'scale_', np.ones(X_raw.shape[1])), dtype=np.float32)
+            else:
+                _refit_and_rescale_on_rank0()
 
     # -----------------------------
     # Multi-target scale statistics
@@ -674,8 +1060,50 @@ def get_dataloaders(cfg: dict):
         print(f"[get_dataloaders] Warning: failed to compute target scales: {e}")
 
     bs = int((cfg.get("training", {}) or {}).get("batch_size", 256))
+
+    # DDP: shard datasets with DistributedSampler (otherwise every rank sees all data)
+    import torch.distributed as dist
+    is_ddp = dist.is_available() and dist.is_initialized()
+    if is_ddp:
+        from torch.utils.data.distributed import DistributedSampler
+
+        train_sampler = DistributedSampler(train_set, shuffle=True, drop_last=False)
+        val_sampler = DistributedSampler(val_set, shuffle=False, drop_last=False)
+        test_sampler = DistributedSampler(test_set, shuffle=False, drop_last=False)
+        return {
+            "train": DataLoader(train_set, batch_size=bs, sampler=train_sampler, shuffle=False),
+            "val": DataLoader(val_set, batch_size=bs, sampler=val_sampler, shuffle=False),
+            "test": DataLoader(test_set, batch_size=bs, sampler=test_sampler, shuffle=False),
+        }
+
     return {
         "train": DataLoader(train_set, batch_size=bs, shuffle=True),
         "val": DataLoader(val_set, batch_size=bs, shuffle=False),
         "test": DataLoader(test_set, batch_size=bs, shuffle=False),
     }
+
+
+def make_dataset(data_path: str, cfg: dict, *, scaler_path: str | None = None, train: bool = False):
+    """Dataset factory for predict/export/SHAP scripts.
+
+    It mirrors get_dataloaders() behavior:
+      - CSV -> ZDataset / MolCachedZDataset
+      - NPZ -> NPZDataset / MolCachedNPZDataset
+    """
+    paths = cfg.get("paths", {}) or {}
+    mol_enabled = bool((cfg.get("mol_encoder") or {}).get("enabled", False))
+
+    if scaler_path is None:
+        scaler_path = paths.get("scaler", None)
+    if not scaler_path and not mol_enabled:
+        save_dir = paths.get("save_dir", "results/latest")
+        scaler_path = os.path.join(save_dir, "scaler.pkl")
+
+    if _is_npz(data_path):
+        if mol_enabled:
+            return MolCachedNPZDataset(npz_path=str(data_path), cfg=cfg)
+        return NPZDataset(npz_path=str(data_path), scaler_path=str(scaler_path), cfg=cfg, train=bool(train))
+    else:
+        if mol_enabled:
+            return MolCachedZDataset(csv_path=str(data_path), cfg=cfg)
+        return ZDataset(csv_path=str(data_path), scaler_path=str(scaler_path), cfg=cfg, train=bool(train))

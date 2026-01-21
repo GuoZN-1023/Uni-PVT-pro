@@ -33,7 +33,7 @@ def _model_forward(model, x):
             expert_all = next(iter(exps.values()))
     return fused, gate_w, expert_all
 from models.fusion_model import FusionModel
-from utils.dataset import ZDataset, MolCachedZDataset
+from utils.dataset import make_dataset
 from utils.logger import get_file_logger
 
 
@@ -113,14 +113,12 @@ def main():
     data_path = paths.get("data", None)
 
     if test_csv:
-        dataset = (MolCachedZDataset(csv_path=test_csv, cfg=cfg) if mol_enabled
-                   else ZDataset(csv_path=test_csv, scaler_path=scaler_path, cfg=cfg, train=False))
+        dataset = make_dataset(test_csv, cfg, scaler_path=scaler_path, train=False)
     else:
         # Backward compatible: single CSV + random split
         if not data_path:
             raise ValueError("predict.py requires either paths.test_data or paths.data")
-        dataset = (MolCachedZDataset(csv_path=data_path, cfg=cfg) if mol_enabled
-                   else ZDataset(csv_path=data_path, scaler_path=scaler_path, cfg=cfg, train=False))
+        dataset = make_dataset(data_path, cfg, scaler_path=scaler_path, train=False)
 
     target_cols = list(getattr(dataset, "target_cols", []))
     feature_cols = list(getattr(dataset, "feature_cols", []))

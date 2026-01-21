@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import random_split
 
 from models.fusion_model import FusionModel
-from utils.dataset import ZDataset
+from utils.dataset import make_dataset
 from utils.logger import get_file_logger
 
 
@@ -120,13 +120,13 @@ def main():
     data_csv = paths.get("data", None)
 
     if train_csv and test_csv:
-        train_ds = ZDataset(csv_path=train_csv, scaler_path=scaler_path, cfg=cfg, train=False)
-        test_ds = ZDataset(csv_path=test_csv, scaler_path=scaler_path, cfg=cfg, train=False)
+        train_ds = make_dataset(train_csv, cfg, scaler_path=scaler_path, train=False)
+        test_ds = make_dataset(test_csv, cfg, scaler_path=scaler_path, train=False)
         dataset = test_ds  # for dims/cols only
     else:
         if not data_csv:
             raise ValueError("shap_analysis.py requires paths.train_data/test_data or paths.data")
-        dataset = ZDataset(csv_path=data_csv, scaler_path=scaler_path, cfg=cfg, train=False)
+        dataset = make_dataset(data_csv, cfg, scaler_path=scaler_path, train=False)
         train_ds, test_ds = None, None
 
     target_cols = list(getattr(dataset, "target_cols", []))

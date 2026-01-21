@@ -8,6 +8,8 @@ import traceback
 from datetime import datetime
 import yaml
 import subprocess
+import fnmatch
+import csv as _csv
 
 # Keep a global copy so the outer exception handler can still read config
 BASE_CFG = {}
@@ -114,6 +116,54 @@ def _cleanup_extra_csv(exp_dir: str, keep_abs_paths: set[str], runall_log: str):
     _append(runall_log, f"[run_all] CSV cleanup removed {removed} extra csv files.")
 
 
+def _build_mol_cache_input_csv(molecules_dir: str, out_csv: str, *, pattern: str, mol_id_col: str, smiles_col: str) -> int:
+    """Scan per-molecule CSVs and write a compact (mol_id, SMILES) table.
+
+    We only read header + first data row from each file to keep it cheap.
+    Returns number of unique molecules collected.
+    """
+    mol_map = {}
+    for root, _, files in os.walk(molecules_dir):
+        for fn in files:
+            if not fnmatch.fnmatch(fn, pattern):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                    reader = _csv.reader(f)
+                    header = next(reader, None)
+                    if not header:
+                        continue
+                    header = [h.strip() for h in header]
+                    if mol_id_col not in header or smiles_col not in header:
+                        continue
+                    mi = header.index(mol_id_col)
+                    si = header.index(smiles_col)
+                    row = None
+                    for r in reader:
+                        if r and any(x.strip() for x in r):
+                            row = r
+                            break
+                    if row is None or mi >= len(row) or si >= len(row):
+                        continue
+                    mid = str(row[mi]).strip()
+                    smi = str(row[si]).strip()
+                    if not mid or not smi:
+                        continue
+                    mol_map.setdefault(mid, smi)
+            except Exception:
+                continue
+
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow([mol_id_col, smiles_col])
+        for mid, smi in mol_map.items():
+            w.writerow([mid, smi])
+
+    return len(mol_map)
+
+
 def _resolve_root_results_dir(base_cfg: dict) -> str:
     """
     A-mode directory scheme:
@@ -206,6 +256,7 @@ def main():
     paths_cfg = cfg.get("paths", {}) or {}
     data_cfg = cfg.get("data", {}) or {}
     sampling_cfg = (data_cfg.get("sampling", {}) or {}) if isinstance(data_cfg, dict) else {}
+    pattern = str(sampling_cfg.get("pattern", "*.csv"))
 
     molecules_dir = paths_cfg.get("molecules_dir", None)
 
@@ -236,12 +287,13 @@ def main():
         seed = int((cfg.get("training", {}) or {}).get("seed", 42))
 
         total_rows = int(sampling_cfg.get("total_rows", 1_000_000))
-        pattern = str(sampling_cfg.get("pattern", "*.csv"))
         expert_col = str(cfg.get("expert_col", "no"))
 
+        export_npz = bool(sampling_cfg.get("export_npz", True))
+        delete_csv = bool(sampling_cfg.get("delete_csv", True))
+
         _append(runall_log, "\n===== STAGE: PREP_DATASET =====")
-        run_cmd(
-            [
+        cmd = [
                 python_exec,
                 "prepare_dataset.py",
                 "--molecules_dir",
@@ -262,7 +314,15 @@ def main():
                 str(test_ratio),
                 "--seed",
                 str(seed),
-            ],
+            ]
+
+        if export_npz:
+            cmd.append("--export_npz")
+        if delete_csv:
+            cmd.append("--delete_csv")
+
+        run_cmd(
+            cmd,
             stdout_path=ds_out,
             stderr_path=ds_err,
             runall_log=runall_log,
@@ -270,14 +330,63 @@ def main():
 
         # Wire split files into config (train/predict/shap will consume them)
         cfg.setdefault("paths", {})
-        cfg["paths"]["train_data"] = os.path.join(dataset_dir, "train.csv")
-        cfg["paths"]["val_data"] = os.path.join(dataset_dir, "val.csv")
-        cfg["paths"]["test_data"] = os.path.join(dataset_dir, "test.csv")
+        ext = "npz" if export_npz else "csv"
+        cfg["paths"]["train_data"] = os.path.join(dataset_dir, f"train.{ext}")
+        cfg["paths"]["val_data"] = os.path.join(dataset_dir, f"val.{ext}")
+        cfg["paths"]["test_data"] = os.path.join(dataset_dir, f"test.{ext}")
 
         # Persist updated config
         with open(exp_config_path, "w", encoding="utf-8") as f:
             yaml.dump(cfg, f, allow_unicode=True)
         shutil.copy(exp_config_path, os.path.join("config", "current.yaml"))
+
+    # ===== Optional: build mol_cache (Uni-PVT 2.0) =====
+    mol_cfg = cfg.get("mol_encoder", {}) or {}
+    mol_enabled = bool(mol_cfg.get("enabled", False))
+    if mol_enabled:
+        cache_cfg = mol_cfg.get("cache", {}) or {}
+        cache_dir = cache_cfg.get("dir", os.path.join(exp_dir, "mol_cache"))
+        z_conf_path = cache_cfg.get("z_conf_path", os.path.join(cache_dir, "z_conf.npy"))
+        e_conf_path = cache_cfg.get("e_conf_path", os.path.join(cache_dir, "e_conf.npy"))
+        id_map_path = cache_cfg.get("id_map_path", os.path.join(cache_dir, "mol_index.csv"))
+        meta_path = cache_cfg.get("meta_path", os.path.join(cache_dir, "meta.json"))
+
+        need_build = not (os.path.exists(z_conf_path) and os.path.exists(e_conf_path) and os.path.exists(id_map_path) and os.path.exists(meta_path))
+        _append(runall_log, f"\n===== STAGE: BUILD_MOL_CACHE (enabled=True, need_build={need_build}) =====")
+
+        if need_build:
+            # Build a compact mol list CSV (mol_id, SMILES) from per-molecule CSV files
+            smiles_col = str(mol_cfg.get("smiles_col", "SMILES"))
+            mol_id_col = str(mol_cfg.get("mol_id_col", "mol_id"))
+            cache_input = os.path.join(exp_dir, "mol_cache_input.csv")
+            n_mols = _build_mol_cache_input_csv(
+                molecules_dir if molecules_dir else paths_cfg.get("data", ""),
+                cache_input,
+                pattern=pattern,
+                mol_id_col=mol_id_col,
+                smiles_col=smiles_col,
+            )
+            if n_mols == 0:
+                raise RuntimeError(
+                    "mol_encoder.enabled=true but failed to build a mol_cache input table. "
+                    f"Please ensure your per-molecule CSVs contain columns '{mol_id_col}' and '{smiles_col}'."
+                )
+
+            _ensure_dir(cache_dir)
+            molcache_out = os.path.join(logs_dir, "build_mol_cache.stdout.log")
+            molcache_err = os.path.join(logs_dir, "build_mol_cache.stderr.log")
+            run_cmd(
+                [python_exec, "build_mol_cache.py", "--csv", cache_input, "--outdir", cache_dir,
+                 "--smiles_col", smiles_col, "--mol_id_col", mol_id_col],
+                stdout_path=molcache_out,
+                stderr_path=molcache_err,
+                runall_log=runall_log,
+            )
+            # Keep workspace clean; dataset output is still only train/val/test.*
+            try:
+                os.remove(cache_input)
+            except Exception:
+                pass
 
     _append(runall_log, "\n===== STAGE: TRAIN =====")
     run_cmd(
