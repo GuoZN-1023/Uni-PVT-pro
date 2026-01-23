@@ -132,15 +132,48 @@ def _generate_conformers(AllChem, mol, k: int, seed: int = 0) -> List[int]:
 
 
 def _mmff_optimize(AllChem, mol, conf_id: int) -> float:
-    props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
-    if props is None:
-        # fallback to UFF if MMFF not available
-        AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=500)
+    """Optimize a conformer and return its forcefield energy.
+
+    IMPORTANT: MMFF/UFF do NOT cover all atom types (e.g., noble gases, exotic valences).
+    We must check parameter availability and optimization convergence.
+    """
+    # Prefer MMFF when fully parameterized.
+    if hasattr(AllChem, "MMFFHasAllMoleculeParams") and AllChem.MMFFHasAllMoleculeParams(mol):
+        props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s")
+        if props is None:
+            raise RuntimeError("MMFF properties unavailable")
+        rc = AllChem.MMFFOptimizeMolecule(mol, mmffVariant="MMFF94s", confId=conf_id, maxIters=500)
+        if rc != 0:
+            raise RuntimeError(f"MMFF optimize failed rc={rc}")
+        ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
+        return float(ff.CalcEnergy())
+
+    # Fallback to UFF only if parameterized.
+    if hasattr(AllChem, "UFFHasAllMoleculeParams") and AllChem.UFFHasAllMoleculeParams(mol):
+        rc = AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=500)
+        if rc != 0:
+            raise RuntimeError(f"UFF optimize failed rc={rc}")
         ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
         return float(ff.CalcEnergy())
-    AllChem.MMFFOptimizeMolecule(mol, mmffVariant="MMFF94s", confId=conf_id, maxIters=500)
-    ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
-    return float(ff.CalcEnergy())
+
+    raise RuntimeError("No MMFF/UFF params for this molecule")
+
+
+def _fallback_morgan_fp(AllChem, mol, dim: int) -> np.ndarray:
+    """Simplest robust fallback embedding: Morgan fingerprint (2D), sized to `dim`.
+
+    Works for single-atom species and molecules unsupported by MMFF/UFF.
+    Produces a stable, non-zero vector without 3D conformers.
+    """
+    # Use the H-added mol for consistency; Morgan works either way.
+    bv = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=int(dim))
+    arr = np.zeros((int(dim),), dtype=np.float32)
+    # Convert ExplicitBitVect -> numpy
+    # RDKit provides ToBitString; this is fine for dim<=1024 and keeps dependencies minimal.
+    bs = bv.ToBitString()
+    # bs is a string of '0'/'1'
+    arr[:] = np.fromiter((1.0 if c == "1" else 0.0 for c in bs), dtype=np.float32, count=int(dim))
+    return arr
 
 
 def _extract_z_pos(Chem, mol, conf_id: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -183,6 +216,15 @@ def main():
     import pandas as pd
 
     Chem, AllChem = _try_import_rdkit()
+    # RDKit can be very chatty for molecules not covered by MMFF/UFF (e.g., noble gases).
+    # We keep Python-side errors, but mute RDKit's C++ warning spam so logs stay readable.
+    try:
+        from rdkit import RDLogger
+
+        RDLogger.DisableLog("rdApp.error")
+        RDLogger.DisableLog("rdApp.warning")
+    except Exception:
+        pass
     SchNet = _try_import_schnet()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -214,8 +256,22 @@ def main():
         if mol is None:
             failures += 1
             continue
+
+        # Fast-path fallback: species with no meaningful conformers (e.g., single atoms)
+        # or molecules unsupported by MMFF/UFF. We still produce a non-zero embedding
+        # using a 2D Morgan fingerprint so downstream training won't silently get all-zeros.
+        if mol.GetNumAtoms() <= 1 or mol.GetNumBonds() == 0:
+            fp = _fallback_morgan_fp(AllChem, mol, D)
+            z_conf[i, :, :] = np.tile(fp.reshape(1, -1), (K, 1)).astype(np.float16)
+            e_conf[i, :] = 0.0
+            continue
+
         conf_ids = _generate_conformers(AllChem, mol, K, seed=args.seed + i)
         if len(conf_ids) == 0:
+            # fallback if 3D embedding fails
+            fp = _fallback_morgan_fp(AllChem, mol, D)
+            z_conf[i, :, :] = np.tile(fp.reshape(1, -1), (K, 1)).astype(np.float16)
+            e_conf[i, :] = 0.0
             failures += 1
             continue
 
@@ -225,14 +281,18 @@ def main():
 
         energies = []
         embs = []
+        fp_fallback = None
         for j, cid in enumerate(conf_ids[:K]):
             try:
                 E = _mmff_optimize(AllChem, mol, cid)
                 z, pos = _extract_z_pos(Chem, mol, cid)
                 emb = _encode_conformer(schnet, z, pos)
             except Exception:
+                # Robust fallback: use Morgan FP instead of writing zeros.
+                if fp_fallback is None:
+                    fp_fallback = _fallback_morgan_fp(AllChem, mol, D)
                 E = float("nan")
-                emb = np.zeros((D,), dtype=np.float32)
+                emb = fp_fallback
             energies.append(E)
             embs.append(emb)
 
