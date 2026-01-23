@@ -1,29 +1,7 @@
-"""utils/thermo_pinn.py
-
-Physics-informed loss for thermodynamic consistency.
-
-This file now supports TWO input modes:
-
-1) legacy "scaled-features" mode
-   - pinn_input = x_scaled with StandardScaler
-   - we unscale P/T internally using scaler_mean/scale + feature_cols
-
-2) Uni-PVT 2.0 "state" mode
-   - pinn_input = state tensor (B,2) where [:,0]=T(K), [:,1]=P(Pa)
-   - no scaler needed; gradients are taken directly w.r.t. T and P
-
-Both modes implement the same residuals (when the corresponding targets exist):
-  - d(ln phi)/dp = (Z-1)/p
-  - dH/dp = -(R*T^2/p) * dZ/dT
-  - dS/dp = -(R/p) * (Z + T*dZ/dT)
-
-To make PINN affordable, we support stochastic subsampling (default 25% of batch).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -57,38 +35,44 @@ class ThermoPinnLoss(nn.Module):
 
         # choose mode
         input_mode = str(pinn_cfg.get("input_mode", "auto")).lower()
+        if input_mode in {"scaled_features", "scaled-feature", "scaledfeatures"}:
+            input_mode = "scaled"
         if input_mode == "auto":
-            # if mol_encoder is enabled, default to state mode
             input_mode = "state" if bool((cfg.get("mol_encoder") or {}).get("enabled", False)) else "scaled"
         if input_mode not in {"scaled", "state"}:
             raise ValueError(f"[PINN] Unknown input_mode={input_mode}. Use 'scaled' or 'state'.")
         self.input_mode = input_mode
 
-        # required names
+        # target names
         self.z_name = str(pinn_cfg.get("z_name", "Z (-)"))
         self.lnphi_name = str(pinn_cfg.get("lnphi_name", "lnphi (-)"))
         self.h_name = str(pinn_cfg.get("h_name", "H (J/mol)"))
         self.s_name = str(pinn_cfg.get("s_name", "S (J/mol/K)"))
 
-        # feature names (legacy)
+        # state feature names for scaled mode (direct)
         self.p_feature = str(pinn_cfg.get("p_feature", "P (MPa)"))
         self.t_feature = str(pinn_cfg.get("t_feature", "T (K)"))
 
-        # universal gas constant (J/mol/K)
+        # reduced-state fallback (scaled mode): T = Tr*Tc; P(Pa) = pr*Pc(Pa)
+        self.tr_feature = str(pinn_cfg.get("tr_feature", "T_r (-)"))
+        self.tc_feature = str(pinn_cfg.get("tc_feature", "T_c (K)"))
+        self.pr_feature = str(pinn_cfg.get("pr_feature", "p_r (-)"))
+        self.pc_feature = str(pinn_cfg.get("pc_feature", "p_c (Pa)"))
+
+        # constants
         self.register_buffer("R", torch.tensor(8.314462618, dtype=torch.float32), persistent=False)
 
-        # legacy scaler params
+        # data descriptors
         self.feature_cols = list(feature_cols or [])
         self.target_cols = list(target_cols or [])
         self.scaler_mean = scaler_mean
         self.scaler_scale = scaler_scale
 
-        # set indices for targets
+        # indices
         self.idxs = self._resolve_target_indices(self.target_cols)
 
         # safety knobs
-        self.p_min = float(pinn_cfg.get("p_min", 1.0))
-        self.p_unit = str(pinn_cfg.get("p_unit", "Pa"))  # for state mode
+        self.p_min = float(pinn_cfg.get("p_min", 1.0))  # Pa
         self.p_in_state_is_mpa = bool(pinn_cfg.get("p_in_state_is_mpa", False))
 
     def _resolve_target_indices(self, target_cols: List[str]) -> _Idx:
@@ -112,32 +96,56 @@ class ThermoPinnLoss(nn.Module):
         m = max(1, int(round(n * r)))
         return torch.randperm(n, device=device)[:m]
 
-    def _unscale_p_t(self, x_scaled: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Legacy path: recover T(K), P(Pa) from scaled features."""
+    def _scaled_state_from_x(self, x_scaled: torch.Tensor) -> dict:
         if self.scaler_mean is None or self.scaler_scale is None:
-            raise ValueError("[PINN] scaled mode requires scaler_mean/scaler_scale.")
+            raise ValueError("[PINN] scaled mode requires scaler_mean/scaler_scale from dataset.")
         if not self.feature_cols:
-            raise ValueError("[PINN] scaled mode requires feature_cols.")
-        if self.p_feature not in self.feature_cols or self.t_feature not in self.feature_cols:
-            raise ValueError(
-                f"[PINN] scaled mode requires p_feature/t_feature in feature_cols. "
-                f"Missing: {[c for c in [self.p_feature, self.t_feature] if c not in self.feature_cols]}"
-            )
-
-        p_idx = int(self.feature_cols.index(self.p_feature))
-        t_idx = int(self.feature_cols.index(self.t_feature))
+            raise ValueError("[PINN] scaled mode requires feature_cols from dataset.")
 
         mu = self.scaler_mean.to(x_scaled.device)
         sc = self.scaler_scale.to(x_scaled.device)
         x_raw = x_scaled * sc + mu
 
-        T = x_raw[:, t_idx]
-        P_mpa = x_raw[:, p_idx]
-        P = P_mpa * 1.0e6  # MPa -> Pa
-        return T, P
+        # try direct (T,P) first
+        if self.t_feature in self.feature_cols and self.p_feature in self.feature_cols:
+            t_idx = int(self.feature_cols.index(self.t_feature))
+            p_idx = int(self.feature_cols.index(self.p_feature))
+            T = x_raw[:, t_idx]
+            P = x_raw[:, p_idx]
+            if "MPa" in self.p_feature or "mpa" in self.p_feature:
+                P = P * 1.0e6
+            dT_dx = sc[t_idx]          # dT/dx_t
+            dP_dx = sc[p_idx] * (1.0e6 if ("MPa" in self.p_feature or "mpa" in self.p_feature) else 1.0)  # dP(Pa)/dx_p
+            return {"T": T, "P": P, "t_col_idx": t_idx, "p_col_idx": p_idx, "dT_dx": dT_dx, "dP_dx": dP_dx}
+
+        # fallback reduced-state
+        needed = [self.tr_feature, self.tc_feature, self.pr_feature, self.pc_feature]
+        missing = [c for c in needed if c not in self.feature_cols]
+        if missing:
+            raise ValueError(
+                f"[PINN] scaled mode needs either direct ({self.t_feature}, {self.p_feature}) or "
+                f"reduced-state ({', '.join(needed)}). Missing: {missing}"
+            )
+
+        tr_idx = int(self.feature_cols.index(self.tr_feature))
+        tc_idx = int(self.feature_cols.index(self.tc_feature))
+        pr_idx = int(self.feature_cols.index(self.pr_feature))
+        pc_idx = int(self.feature_cols.index(self.pc_feature))
+
+        Tr = x_raw[:, tr_idx]
+        Tc = x_raw[:, tc_idx]
+        pr = x_raw[:, pr_idx]
+        Pc = x_raw[:, pc_idx]  # Pa
+
+        T = Tr * Tc
+        P = pr * Pc
+
+        dT_dx = sc[tr_idx] * Tc      # dT/dx_tr
+        dP_dx = sc[pr_idx] * Pc      # dP(Pa)/dx_pr
+
+        return {"T": T, "P": P, "t_col_idx": tr_idx, "p_col_idx": pr_idx, "dT_dx": dT_dx, "dP_dx": dP_dx}
 
     def _state_to_p_t(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """State mode: interpret state=(T,P)."""
         if state.dim() != 2 or state.size(1) != 2:
             raise ValueError(f"[PINN] state mode expects (B,2) state=(T,P), got {tuple(state.shape)}")
         T = state[:, 0]
@@ -163,14 +171,6 @@ class ThermoPinnLoss(nn.Module):
         *,
         target_cols: Optional[List[str]] = None,
     ) -> torch.Tensor:
-        """Compute PINN loss.
-
-        Args:
-          pinn_input:
-            - scaled mode: x_scaled (B,F)
-            - state mode:  state (B,2) with requires_grad=True
-          preds: (B,T) predictions aligned with target_cols
-        """
         if not self.enabled:
             return torch.zeros((), device=preds.device, dtype=preds.dtype)
 
@@ -184,52 +184,74 @@ class ThermoPinnLoss(nn.Module):
             return torch.zeros((), device=preds.device, dtype=preds.dtype)
 
         preds_s = preds[idx]
-        x_s = pinn_input[idx]
 
-        # Make sure gradients can flow to state variables.
-        if not x_s.requires_grad:
-            x_s = x_s.detach().requires_grad_(True)
+        # NOTE: preds was produced by model forward using the full pinn_input tensor.
+        # Do NOT slice pinn_input first and then differentiate w.r.t. that slice; autograd may
+        # report the sliced tensor was not used in the graph. Differentiate w.r.t x_full and
+        # then take idx rows from the resulting gradient.
+        x_full = pinn_input
+        if not x_full.requires_grad:
+            x_full.requires_grad_(True)
+        x_s = x_full[idx]
 
         if self.input_mode == "scaled":
-            T, P = self._unscale_p_t(x_s)
+            st = self._scaled_state_from_x(x_s)
+            T = st["T"]
+            P = st["P"]
+            t_col = int(st["t_col_idx"])
+            p_col = int(st["p_col_idx"])
+            dT_dx = st["dT_dx"]
+            dP_dx = st["dP_dx"]
+            t_chain = 1.0 / torch.clamp(dT_dx, min=1e-12)
+            p_chain = 1.0 / torch.clamp(dP_dx, min=1e-12)
         else:
             T, P = self._state_to_p_t(x_s)
+            t_col = 0
+            p_col = 1
+            t_chain = torch.ones_like(T)
+            p_chain = torch.full_like(P, 1.0e-6) if self.p_in_state_is_mpa else torch.ones_like(P)
 
         P = torch.clamp(P, min=self.p_min)
 
         loss = torch.zeros((), device=preds.device, dtype=preds.dtype)
         terms = 0
 
-        # --- residual 1: d(lnphi)/dp = (Z-1)/p ---
+        # residual 1: d(lnphi)/dP = (Z-1)/P
         if self.idxs.z is not None and self.idxs.lnphi is not None:
             Z = preds_s[:, self.idxs.z]
             lnphi = preds_s[:, self.idxs.lnphi]
-
-            # gradient w.r.t. P (Pa)
-            dlnphi_dP = self._grad(lnphi, P)
+            dlnphi_dx_full = self._grad(lnphi, x_full)
+            dlnphi_dx = dlnphi_dx_full[idx]
+            dlnphi_dP = dlnphi_dx[:, p_col] * p_chain
             rhs = (Z - 1.0) / P
             loss = loss + torch.mean((dlnphi_dP - rhs) ** 2)
             terms += 1
 
-        # need dZ/dT for H and S constraints
+        # dZ/dT for H,S residuals
         dZ_dT = None
         if self.idxs.z is not None and (self.idxs.h is not None or self.idxs.s is not None):
             Z = preds_s[:, self.idxs.z]
-            dZ_dT = self._grad(Z, T)
+            dZ_dx_full = self._grad(Z, x_full)
+            dZ_dx = dZ_dx_full[idx]
+            dZ_dT = dZ_dx[:, t_col] * t_chain
 
-        # --- residual 2: dH/dp = -(R*T^2/p) * dZ/dT ---
+        # residual 2: dH/dP = -(R*T^2/P) dZ/dT
         if self.idxs.h is not None and dZ_dT is not None:
             H = preds_s[:, self.idxs.h]
-            dH_dP = self._grad(H, P)
+            dH_dx_full = self._grad(H, x_full)
+            dH_dx = dH_dx_full[idx]
+            dH_dP = dH_dx[:, p_col] * p_chain
             rhs = -(self.R * (T ** 2) / P) * dZ_dT
             loss = loss + torch.mean((dH_dP - rhs) ** 2)
             terms += 1
 
-        # --- residual 3: dS/dp = -(R/p) * (Z + T*dZ/dT) ---
+        # residual 3: dS/dP = -(R/P) (Z + T dZ/dT)
         if self.idxs.s is not None and dZ_dT is not None and self.idxs.z is not None:
             S = preds_s[:, self.idxs.s]
             Z = preds_s[:, self.idxs.z]
-            dS_dP = self._grad(S, P)
+            dS_dx_full = self._grad(S, x_full)
+            dS_dx = dS_dx_full[idx]
+            dS_dP = dS_dx[:, p_col] * p_chain
             rhs = -(self.R / P) * (Z + T * dZ_dT)
             loss = loss + torch.mean((dS_dP - rhs) ** 2)
             terms += 1

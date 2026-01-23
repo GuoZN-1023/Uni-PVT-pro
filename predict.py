@@ -14,7 +14,7 @@ import plotly.express as px
 def _model_forward(model, x):
     """
     Supports both legacy tuple output and the new dict output.
-    Returns: fused (B,T), gate_w (dict or tensor), expert_outputs_all (B,4,T)
+    Returns: fused (B,T), gate_w (dict or tensor), expert_outputs_all (B,5,T)
     """
     out = model(x)
     if isinstance(out, tuple) or isinstance(out, list):
@@ -220,10 +220,10 @@ def main():
 
     y_true = np.concatenate(y_true_list, axis=0)              # (N,T)
     y_fused = np.concatenate(fused_list, axis=0)              # (N,T)
-    gate_w = np.concatenate(w_list, axis=0)                   # (N,4)
+    gate_w = np.concatenate(w_list, axis=0)                   # (N,5)
     gate_w_z = np.concatenate(w_z_list, axis=0) if len(w_z_list) else None
     gate_w_props = np.concatenate(w_props_list, axis=0) if len(w_props_list) else None
-    y_experts = np.concatenate(experts_list, axis=0)          # (N,4,T)
+    y_experts = np.concatenate(experts_list, axis=0)          # (N,5,T)
 
     # ---- fused metrics (overall) ----
     fused_met = compute_metrics(y_true, y_fused)
@@ -247,7 +247,7 @@ def main():
         yaml.dump(metrics_summary, f, allow_unicode=True)
 
     # ---- expert-only metrics (overall) ----
-    expert_names = ["gas", "liquid", "critical", "extra"]
+    expert_names = cfg["experts_order"]
     expert_metrics_rows = []
     for k, name in enumerate(expert_names):
         met = compute_metrics(y_true, y_experts[:, k, :])
@@ -277,34 +277,31 @@ def main():
     df_pred["expert_id"] = test_expert_ids.astype(int)
 
     # gate weights
-    df_pred["gate_w_gas"] = gate_w[:, 0]
-    df_pred["gate_w_liquid"] = gate_w[:, 1]
-    df_pred["gate_w_critical"] = gate_w[:, 2]
-    df_pred["gate_w_extra"] = gate_w[:, 3]
+    for i, name in enumerate(cfg["experts_order"]):
+        df_pred[f"gate_w_{name}"] = gate_w[:, i]
+
 
     if gate_w_z is not None:
-        df_pred["gate_w_Z_gas"] = gate_w_z[:, 0]
-        df_pred["gate_w_Z_liquid"] = gate_w_z[:, 1]
-        df_pred["gate_w_Z_critical"] = gate_w_z[:, 2]
-        df_pred["gate_w_Z_extra"] = gate_w_z[:, 3]
+        for i, name in enumerate(cfg["experts_order"]):
+            df_pred[f"gate_w_{name}"] = gate_w[:, i]
+
     if gate_w_props is not None:
-        df_pred["gate_w_props_gas"] = gate_w_props[:, 0]
-        df_pred["gate_w_props_liquid"] = gate_w_props[:, 1]
-        df_pred["gate_w_props_critical"] = gate_w_props[:, 2]
-        df_pred["gate_w_props_extra"] = gate_w_props[:, 3]
+        for i, name in enumerate(cfg["experts_order"]):
+            df_pred[f"gate_w_{name}"] = gate_w[:, i]
+
 
     # per-target columns
     for j, tgt in enumerate(target_cols):
         df_pred[f"y_true::{tgt}"] = y_true[:, j]
         df_pred[f"y_pred::{tgt}"] = y_fused[:, j]
-        df_pred[f"y_pred_gas::{tgt}"] = y_experts[:, 0, j]
-        df_pred[f"y_pred_liquid::{tgt}"] = y_experts[:, 1, j]
-        df_pred[f"y_pred_critical::{tgt}"] = y_experts[:, 2, j]
-        df_pred[f"y_pred_extra::{tgt}"] = y_experts[:, 3, j]
+        for i, name in enumerate(cfg["experts_order"]):
+            df_pred[f"y_pred_{name}::{tgt}"] = y_experts[:, i, j]
+
 
         # 可选：硬路由（若 expert_id 在 1..4 范围）
         hard = np.full((len(df_pred),), np.nan, dtype=float)
-        mask = (df_pred["expert_id"].values >= 1) & (df_pred["expert_id"].values <= 4)
+        num_experts = len(cfg["experts_order"])
+        mask = (df_pred["expert_id"].values >= 1) & (df_pred["expert_id"].values <= num_experts)
         idx = df_pred.loc[mask, "expert_id"].values.astype(int) - 1
         hard[mask] = y_experts[mask, idx, j]
         df_pred[f"y_pred_hard::{tgt}"] = hard

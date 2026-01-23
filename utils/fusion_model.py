@@ -367,43 +367,29 @@ class FusionModel(nn.Module):
         p_fused, w_p, exps_p = self.head_props(x)  # (B,To), ...  (NOT conditioned on Z as input)
 
         # ---- Reassemble fused in original target order ----
-        # IMPORTANT: avoid in-place writes into a fresh tensor (torch.zeros + slice assignment),
-        # because that breaks the autograd graph for PINN derivatives (d/dT, d/dP).
-        # Instead, rebuild by concatenation so every output remains a function of the original input.
+        # IMPORTANT: do NOT use `torch.zeros(...)` + in-place assignment to rebuild outputs.
+        # That breaks the autograd graph and makes PINN derivatives dZ/dx fail.
         B = x.shape[0]
         T = len(self.target_cols)
 
-        # Map other targets in the same order as target_cols excluding Z
-        other_names = [c for c in self.target_cols if c != self.z_name]
+        # target_cols without Z, in original order
         other_indices = [i for i, c in enumerate(self.target_cols) if c != self.z_name]
-        if p_fused.size(1) != len(other_names):
-            raise RuntimeError(
-                f"[FusionModel] props head output dim mismatch: got {p_fused.size(1)}, "
-                f"expected {len(other_names)} (targets without Z)."
-            )
 
-        # fused: (B,T)
-        p_ptr = 0
-        fused_parts = []
-        for name in self.target_cols:
-            if name == self.z_name:
-                fused_parts.append(z_pred)
-            else:
-                fused_parts.append(p_fused[:, p_ptr:p_ptr+1])
-                p_ptr += 1
-        fused_all = torch.cat(fused_parts, dim=1)
+        # -------- differentiable reassemble for fused_all --------
+        # Each entry is (B,1), then we cat along dim=1 to preserve graph.
+        fused_parts = [None] * T
+        fused_parts[self.z_out_idx] = z_pred  # (B,1)
+        for j, col_idx in enumerate(other_indices):
+            fused_parts[col_idx] = p_fused[:, j:j+1]  # (B,1)
+        fused_all = torch.cat(fused_parts, dim=1)  # (B,T)
 
-        # experts: (B,E,T)
-        n_experts = exps_z.shape[1]
-        p_ptr = 0
-        exp_parts = []
-        for name in self.target_cols:
-            if name == self.z_name:
-                exp_parts.append(exps_z)
-            else:
-                exp_parts.append(exps_p[:, :, p_ptr:p_ptr+1])
-                p_ptr += 1
-        exps_all = torch.cat(exp_parts, dim=2)
+        # -------- differentiable reassemble for exps_all --------
+        n_experts = exps_z.shape[1]  # ✅ 自动 = 5
+        exps_parts = [None] * T
+        exps_parts[self.z_out_idx] = exps_z  # (B,E,1)
+        for j, col_idx in enumerate(other_indices):
+            exps_parts[col_idx] = exps_p[:, :, j:j+1]  # (B,E,1)
+        exps_all = torch.cat(exps_parts, dim=2)  # (B,E,T)
 
 
         return {

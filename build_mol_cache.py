@@ -59,6 +59,51 @@ def _try_import_schnet():
         ) from e
 
 
+
+def _build_schnet_encoder(SchNet, cfg: "BuildConfig"):
+    """Create a SchNet that outputs a graph-level embedding of size cfg.embed_dim.
+
+    PyG SchNet API differs across versions. Newer versions accept `out_channels`;
+    older ones don't (they default to scalar output). We detect the signature and
+    patch the final linear layer when needed so the output becomes (B, embed_dim).
+    """
+    import inspect
+    import torch.nn as nn
+
+    sig = inspect.signature(SchNet.__init__)
+    params = set(sig.parameters.keys())
+
+    base_kwargs = {}
+    # only pass args that exist in this SchNet version
+    if "hidden_channels" in params:
+        base_kwargs["hidden_channels"] = int(cfg.embed_dim)
+    if "num_filters" in params:
+        base_kwargs["num_filters"] = int(cfg.embed_dim)
+    if "num_interactions" in params:
+        base_kwargs["num_interactions"] = int(cfg.num_interactions)
+    if "num_gaussians" in params:
+        base_kwargs["num_gaussians"] = int(cfg.num_gaussians)
+    if "cutoff" in params:
+        base_kwargs["cutoff"] = float(cfg.cutoff)
+
+    if "out_channels" in params:
+        return SchNet(out_channels=int(cfg.embed_dim), **base_kwargs)
+
+    model = SchNet(**base_kwargs)
+
+    # Patch the last head layer to output embed_dim
+    if hasattr(model, "lin2") and isinstance(model.lin2, nn.Linear):
+        in_f = int(model.lin2.in_features)
+        model.lin2 = nn.Linear(in_f, int(cfg.embed_dim), bias=True)
+    elif hasattr(model, "lin") and isinstance(model.lin, nn.Linear):
+        in_f = int(model.lin.in_features)
+        model.lin = nn.Linear(in_f, int(cfg.embed_dim), bias=True)
+    else:
+        raise RuntimeError(
+            "Unsupported SchNet variant: cannot locate final head (lin2/lin) to patch for embedding output."
+        )
+    return model
+
 @dataclass
 class BuildConfig:
     k_conformers: int = 10
@@ -154,14 +199,7 @@ def main():
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     cfg = BuildConfig(k_conformers=int(args.k), embed_dim=int(args.embed_dim))
-    schnet = SchNet(
-        hidden_channels=cfg.embed_dim,
-        out_channels=cfg.embed_dim,
-        num_filters=cfg.embed_dim,
-        num_interactions=cfg.num_interactions,
-        num_gaussians=cfg.num_gaussians,
-        cutoff=cfg.cutoff,
-    ).to(device)
+    schnet = _build_schnet_encoder(SchNet, cfg).to(device)
     schnet.eval()
 
     n_mols = len(mol_ids)

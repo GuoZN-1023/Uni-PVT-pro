@@ -1,21 +1,23 @@
 # =========================
-# Uni-PVT Training Config (Compat + Integrated Uni-PVT 2.0)
-# - Default: legacy scalar features training (your current workflow)
-# - Optional: cached molecular encoding (Uni-PVT 2.0) by flipping mol_encoder.enabled=true
+# Uni-PVT Training Config (Integrated)
+# - legacy scalar workflow by default
+# - Uni-PVT 2.0 (mol cache) remains a clean switch
 # =========================
 
 paths:
-  data: /home/thermo2025/Uni-PVT-Data-20260115-v1.0
-  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest
-  scaler: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/scaler.pkl
+  data: /home/thermo2025/Uni-PVT-Data-20260122
+  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/latest
+  scaler: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/latest/scaler.pkl
 
-  train_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/train.csv
-  val_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/val.csv
-  test_data: /home/thermo2025/Uni-PVT_results/results_gzn_20260115/latest/dataset/test.csv
+  # ✅ 显式 split：直接指向你已生成好的 NPZ（不会重新预处理）
+  train_data: /home/thermo2025/Uni-PVT-Data-20260122-gzn/dataset_npz/train.npz
+  val_data:   /home/thermo2025/Uni-PVT-Data-20260122-gzn/dataset_npz/val.npz
+  test_data:  /home/thermo2025/Uni-PVT-Data-20260122-gzn/dataset_npz/test.npz
 
 data:
+  # ✅ 你要复用旧 split，就必须关掉 sampling（否则可能又去“生成/划分”）
   sampling:
-    enabled: true
+    enabled: false
     total_rows: 100000
     pattern: "*.csv"
 
@@ -30,20 +32,10 @@ data:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
-
-  limit_rows: 100000
+  limit_rows: 0
 
 expert_col: "no"
 
-# -------------------------
-# Columns
-# -------------------------
-# 兼容策略：你继续用 reduced 特征训练不变；
-# 但为了 PINN 和未来 mol_encoder 的 state 输入更可靠，建议 CSV 里同时存在：
-#   "T (K)", "P (Pa)" （或至少能从 T_r/T_c 与 p_r/p_c 推出来）
-#
-# 如果你的 CSV 目前没有 "T (K)" 与 "P (Pa)"，可以先保持不加，
-# 但当你启用 mol_encoder 或启用 pinn.input_mode=state 时，必须有这两列。
 feature_cols:
   - "T_r (-)"
   - "p_r (-)"
@@ -56,26 +48,22 @@ targets:
   - "Z (-)"
   - "S (J/mol/K)"
 
-# -------------------------
-# Model: Mixture-of-Experts
-# -------------------------
+_expert_block: &expert_block
+  hidden_layers: [512, 256, 128, 64]
+  activation: gelu
+  dropout: 0.0
+
 experts:
-  gas:
-    hidden_layers: [512, 256, 128, 64]
-    activation: gelu
-    dropout: 0.0
-  liquid:
-    hidden_layers: [512, 256, 128, 64]
-    activation: gelu
-    dropout: 0.0
-  critical:
-    hidden_layers: [512, 256, 128, 64]
-    activation: gelu
-    dropout: 0.0
-  extra:
+  gas: *expert_block
+  liquid: *expert_block
+  transition: *expert_block
+  supercritical:
     hidden_layers: [512, 256, 128]
     activation: gelu
     dropout: 0.0
+  critical: *expert_block
+
+experts_order: ["gas", "liquid", "transition", "supercritical", "critical"]
 
 gate:
   hidden_layers: [512, 256, 128, 64]
@@ -83,24 +71,20 @@ gate:
   dropout: 0.05
 
 model:
-  # 交给程序自动推断更安全（你改 feature_cols/targets 时不会炸）
   input_dim: null
   output_dim: null
+  n_experts: 5
 
 runtime:
   device: auto
-  amp:
-    enabled: true
-  tf32:
-    enabled: true
-  compile:
-    enabled: false
+  amp: { enabled: true }
+  tf32: { enabled: true }
+  compile: { enabled: false }
 
 training:
   seed: 42
   batch_size: 512
   gradient_clip_norm: 0.0
-
   learning_rate: 0.0005
   weight_decay: 0.0
 
@@ -115,14 +99,6 @@ training:
     warmup_epochs: 5
     warmup_start_factor: 0.2
     min_lr: 1.0e-5
-    step_size: 20
-    gamma: 0.5
-    plateau:
-      mode: min
-      factor: 0.5
-      patience: 8
-      threshold: 0.0
-      min_lr: 1.0e-6
 
   pretrain_epochs: 50
   gate_epochs: 50
@@ -130,7 +106,7 @@ training:
   finetune:
     enabled: true
     epochs: 80
-    unfreeze: ["gas", "liquid", "critical", "extra"]
+    unfreeze: ["gas", "liquid", "transition", "supercritical", "critical"]
     learning_rate: 0.0007
     min_lr: 5.0e-6
 
@@ -160,7 +136,7 @@ loss:
 
   region_weights:
     enabled: true
-    weights: {1: 1.0, 2: 1.5, 3: 2.0, 4: 1.0}
+    weights: {1: 1.0, 2: 1.5, 3: 2.0, 4: 1.0, 5: 1.0}
 
   lambda_nonneg: 3.08e-05
   lambda_smooth: 0.0
@@ -169,27 +145,18 @@ loss:
   lambda_relative: 0.0
   lambda_entropy: -0.01
 
-# -------------------------
-# PINN (Compat)
-# -------------------------
-# 这里我做了“兼容入口”：默认沿用你原本 reduced 逻辑；
-# 当 mol_encoder.enabled=true 时，建议把 input_mode 改成 state 或 auto（由代码自动切换）。
 pinn:
   enabled: true
-
-  # 推荐：auto
-  # - 如果 mol_encoder.enabled=false => 用 reduced/legacy 的解析方式（不破坏你现在训练）
-  # - 如果 mol_encoder.enabled=true  => 走 state=(T,P) 的 PINN（梯度更干净）
   input_mode: auto
 
   z_name: "Z (-)"
   s_name: "S (J/mol/K)"
 
-  # legacy reduced fields（保留兼容）
   pr_feature: "p_r (-)"
   tr_feature: "T_r (-)"
   pc_feature: "p_c (Pa)"
   tc_feature: "T_c (K)"
+
   p_to_Pa: 1.0
   R: 8.31446261815324
   lambda_phi: 0.0005
@@ -202,41 +169,24 @@ pinn:
     apply_in_finetune: true
 
   compute_every_steps: 1
-
-  # stochastic PINN（提速且更稳，旧流程也能用）
   subsample_ratio: 0.25
 
-# -------------------------
-# Uni-PVT 2.0: Cached Molecular Encoding (OFF by default)
-# -------------------------
 mol_encoder:
-  enabled: false
-
-  # 你的样本表里必须有 mol_id（每行对应某个分子在某个状态的样本）
-  mol_id_col: "mol_id"
-
-  # state 输入建议直接使用真实物理量，未来 FiLM + PINN(state) 都从这里拿
-  # 注意：这里是列名，不会影响你 feature_cols 的旧训练
-  state_cols: ["T (K)", "P (Pa)"]
+  enabled: true
+  mol_id_col: "SMILES"
+  state_cols: ["T_r (-)", "p_r (-)"]
 
   cache:
-    backend: "memmap"   # 推荐 memmap；若你已做了 lmdb，也可改成 lmdb
-    dir: /home/thermo2025/Uni-PVT-Data-20260115-v1.0/mol_cache
-    meta_path: /home/thermo2025/Uni-PVT-Data-20260115-v1.0/mol_cache/meta.json
-
-    # memmap
-    z_conf_path: /home/thermo2025/Uni-PVT-Data-20260115-v1.0/mol_cache/z_conf.npy
-    e_conf_path: /home/thermo2025/Uni-PVT-Data-20260115-v1.0/mol_cache/e_conf.npy
-    id_map_path: /home/thermo2025/Uni-PVT-Data-20260115-v1.0/mol_cache/mol_index.csv
-
-    # lmdb（如果你后续要用）
-    # z_conf_lmdb: /home/thermo2025/Uni-PVT-Data-20260115-v1.0/mol_cache/z_conf.lmdb
-    # e_conf_lmdb: /home/thermo2025/Uni-PVT-Data-20260115-v1.0/mol_cache/e_conf.lmdb
+    backend: "memmap"
+    dir: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache
+    meta_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/meta.json
+    z_conf_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/z_conf.npy
+    e_conf_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/e_conf.npy
+    id_map_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/mol_index.csv
 
   boltzmann:
     alpha: 1.0
-    energy_unit: "kcal_per_mol"  # build cache 默认常见是 kcal/mol
-    # 如果你能量不是 kcal/mol，可用 scale_to_kcal 先统一
+    energy_unit: "kcal_per_mol"
     scale_to_kcal: 1.0
 
   state_embedding:
@@ -246,50 +196,10 @@ mol_encoder:
     include_logp: true
     include_invT: true
 
-  film:
-    enabled: true
+  film: { enabled: true }
 
   phase_embedding:
     enabled: true
     phase_col: "no"
     num_phases: 16
     dim: 16
-
-pt_viz:
-  enabled: true
-  diff_mode: pred_minus_true
-  per_target: true
-  allow_fail: true
-
-shap:
-  enabled: true
-  max_samples: 2000
-  save_csv: false
-
-exports:
-  enabled: true
-  outdir_name: exports
-  files:
-    pretrain_best_predictions: "pretrain_best_predictions.csv"
-    pretrain_best_metrics: "pretrain_best_metrics.csv"
-    gate_test_predictions: "gate_test_predictions.csv"
-    gate_test_metrics: "gate_test_metrics.csv"
-    finetune_test_predictions: "finetune_test_predictions.csv"
-    finetune_test_metrics: "finetune_test_metrics.csv"
-
-  predictions_keep:
-    keep_features: true
-    keep_expert_col: true
-
-  cleanup_other_csv: true
-  cleanup_allowlist_dirs:
-    - exports
-
-optuna:
-  enabled: false
-  n_trials: 50
-  sampler: "tpe"
-  directions: ["minimize", "minimize", "minimize"]
-  study_name: "uni_pvt_mo"
-  storage: null
-  search_space: {}

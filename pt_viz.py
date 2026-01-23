@@ -12,6 +12,8 @@ import plotly.io as pio
 
 REGION_COLORS = {1: "#E699A7", 2: "#FEDD9E", 3: "#A6D9C0", 4: "#71A7D2"}
 REGION_LABELS = {1: "气相区 (Gas)", 2: "液相区 (Liquid)", 3: "相变区 (Phase Change)", 4: "临界区 (Critical)"}
+REGION_COLORS[5] = "#9B7EDE"
+REGION_LABELS[5] = "超临界区 / Critical Core"
 
 
 # ------------------------------ 基础工具 ------------------------------
@@ -258,7 +260,7 @@ def make_3d_true_pred(
     value_label: str,
 ) -> go.Figure:
     traces = []
-    for r in [1, 2, 3, 4]:
+    for r in sorted(df[col_region].unique()):
         sub = df[df[col_region] == r]
         if len(sub) == 0:
             continue
@@ -306,7 +308,7 @@ def make_3d_single(
     z_label: str,
 ) -> go.Figure:
     traces = []
-    for r in [1, 2, 3, 4]:
+    for r in sorted(df[col_region].unique()):
         sub = df[df[col_region] == r]
         if len(sub) == 0:
             continue
@@ -349,7 +351,7 @@ def make_projection_xz(
     x_log: bool = False,
 ) -> go.Figure:
     traces = []
-    for r in [1, 2, 3, 4]:
+    for r in sorted(df[col_region].unique()):
         sub = df[df[col_region] == r]
         if len(sub) == 0:
             continue
@@ -393,7 +395,7 @@ def make_projection_pt_with_contours(
     traces: List[go.BaseTraceType] = []
     LINE_COLOR = "rgba(20,20,20,0.55)"
 
-    for r in [1, 2, 3, 4]:
+    for r in sorted(df[col_region].unique()):
         sub = df[df[col_region] == r]
         if len(sub) < 12:
             continue

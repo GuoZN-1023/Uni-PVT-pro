@@ -308,15 +308,29 @@ def main():
 
     molecules_dir = paths_cfg.get("molecules_dir", None)
 
+    # ========= ✅ NEW: detect explicit split =========
+    has_explicit_splits = bool(paths_cfg.get("train_data")) and bool(paths_cfg.get("val_data")) and bool(paths_cfg.get("test_data"))
+
     # Backward-compatible convenience:
     # If paths.data points to a DIRECTORY (containing many molecule CSVs), treat it as molecules_dir
+    # BUT: only do this when we actually intend to sample/build dataset (no explicit splits).
     data_path = paths_cfg.get("data", None)
-    if (not molecules_dir) and data_path and os.path.isdir(data_path):
+    if (not molecules_dir) and (not has_explicit_splits) and data_path and os.path.isdir(data_path):
         molecules_dir = data_path
         cfg.setdefault("paths", {})
         cfg["paths"]["molecules_dir"] = molecules_dir
 
-    ds_enabled = bool(sampling_cfg.get("enabled", False)) or bool(molecules_dir)
+    # ========= ✅ NEW: ds_enabled logic =========
+    # Only enable PREP_DATASET if:
+    #   - sampling.enabled is True
+    #   - OR molecules_dir is provided AND explicit splits are NOT provided
+    ds_enabled = bool(sampling_cfg.get("enabled", False)) or (bool(molecules_dir) and (not has_explicit_splits))
+
+    if has_explicit_splits and (not ds_enabled):
+        _append(runall_log, "\n[run_all] Explicit train/val/test provided. Skipping PREP_DATASET.")
+        _append(runall_log, f"[run_all] train_data: {paths_cfg.get('train_data')}")
+        _append(runall_log, f"[run_all] val_data:   {paths_cfg.get('val_data')}")
+        _append(runall_log, f"[run_all] test_data:  {paths_cfg.get('test_data')}")
 
     if ds_enabled:
         if not molecules_dir:
@@ -342,27 +356,27 @@ def main():
 
         _append(runall_log, "\n===== STAGE: PREP_DATASET =====")
         cmd = [
-                python_exec,
-                "prepare_dataset.py",
-                "--molecules_dir",
-                str(molecules_dir),
-                "--outdir",
-                str(dataset_dir),
-                "--total_rows",
-                str(total_rows),
-                "--expert_col",
-                expert_col,
-                "--pattern",
-                pattern,
-                "--train_ratio",
-                str(train_ratio),
-                "--val_ratio",
-                str(val_ratio),
-                "--test_ratio",
-                str(test_ratio),
-                "--seed",
-                str(seed),
-            ]
+            python_exec,
+            "prepare_dataset.py",
+            "--molecules_dir",
+            str(molecules_dir),
+            "--outdir",
+            str(dataset_dir),
+            "--total_rows",
+            str(total_rows),
+            "--expert_col",
+            expert_col,
+            "--pattern",
+            pattern,
+            "--train_ratio",
+            str(train_ratio),
+            "--val_ratio",
+            str(val_ratio),
+            "--test_ratio",
+            str(test_ratio),
+            "--seed",
+            str(seed),
+        ]
 
         if export_npz:
             cmd.append("--export_npz")

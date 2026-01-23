@@ -233,9 +233,45 @@ def _fused_from_experts(out: Dict[str, Any], *, prefer_fused: bool = True) -> to
     if prefer_fused and ("fused" in out) and (out["fused"] is not None):
         return out["fused"]
 
-    experts = _experts_from_out(out)  # (N,E,T)
-    gate_w = _gate_from_out(out)      # (N,E) or dict
+    gate_w = _gate_from_out(out)  # (N,E) or dict
 
+    # Cascade mode: different gates for Z and other props
+    if isinstance(gate_w, dict) and bool(out.get("aux", {}).get("cascade", False)):
+        aux = out.get("aux", {}) or {}
+        z_idx = int(aux.get("z_out_idx", 0))
+        other_inds = list(aux.get("other_indices", []))
+
+        # Prefer explicit expert_outputs if present (shape-safe)
+        eo = out.get("expert_outputs", {}) or {}
+        exps_z = eo.get("z", None)
+        exps_p = eo.get("props", None)
+        if exps_z is None or exps_p is None:
+            # fallback to combined experts tensor
+            experts_all = _experts_from_out(out)  # (N,E,T)
+            exps_z = experts_all[:, :, z_idx : z_idx + 1]  # (N,E,1)
+            exps_p = experts_all[:, :, other_inds] if other_inds else experts_all[:, :, :0]
+
+        wz = gate_w.get("z", None)
+        wp = gate_w.get("props", None)
+        if wz is None or wp is None:
+            # last fallback: any gate
+            w_any = next(iter(gate_w.values()))
+            wz = w_any
+            wp = w_any
+
+        fused_z = torch.einsum("nei,ne->ni", exps_z, wz)  # (N,1)
+        fused_p = torch.einsum("net,ne->nt", exps_p, wp) if exps_p.numel() else exps_p.new_zeros((exps_z.size(0), 0))
+
+        B = fused_z.size(0)
+        T = int(out["fused"].shape[1]) if ("fused" in out and out["fused"] is not None) else (1 + fused_p.size(1))
+        fused_all = fused_z.new_zeros((B, T))
+        fused_all[:, z_idx : z_idx + 1] = fused_z
+        if other_inds:
+            fused_all[:, other_inds] = fused_p
+        return fused_all
+
+    # Non-cascade: single gate over all targets
+    experts = _experts_from_out(out)  # (N,E,T)
     if isinstance(gate_w, dict):
         gate_w = gate_w.get("all", next(iter(gate_w.values())))
     return torch.einsum("net,ne->nt", experts, gate_w)
@@ -487,23 +523,25 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
             p.requires_grad = False
         for p in expert_params:
             p.requires_grad = True
+        n_experts = int((_get_cfg(cfg, "model.n_experts", 4)))
+        eids = tuple(range(1, n_experts + 1))
 
-        best_stage1 = {1: float("inf"), 2: float("inf"), 3: float("inf"), 4: float("inf")}
+        best_stage1 = {eid: float("inf") for eid in eids}
         # IMPORTANT: match export_results.py: best_stage1_expert{eid}.pt
-        best_stage1_paths = {eid: os.path.join(ckpt_dir, f"best_stage1_expert{eid}.pt") for eid in (1, 2, 3, 4)}
+        best_stage1_paths = {eid: os.path.join(ckpt_dir, f"best_stage1_expert{eid}.pt") for eid in eids}
 
         @torch.no_grad()
         def _eval_stage1_expert_losses():
             model.eval()
-            totals = {eid: 0.0 for eid in (1, 2, 3, 4)}
-            counts = {eid: 0 for eid in (1, 2, 3, 4)}
+            totals = {eid: 0.0 for eid in eids}
+            counts = {eid: 0 for eid in eids}
             for batch in val_loader:
                 model_in, y, expert_id = _unpack_batch(batch, device)
 
                 out = model(model_in)
                 preds_all = _experts_from_out(out)  # (N,E,T)
 
-                for eid in (1, 2, 3, 4):
+                for eid in eids:
                     mask = (expert_id == eid)
                     if mask.any():
                         preds = preds_all[mask, eid - 1, :]
@@ -512,7 +550,7 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                         totals[eid] += float(loss.item()) * int(mask.sum().item())
                         counts[eid] += int(mask.sum().item())
 
-            return {eid: (totals[eid] / counts[eid] if counts[eid] > 0 else float("inf")) for eid in (1, 2, 3, 4)}
+            return {eid: (totals[eid] / counts[eid] if counts[eid] > 0 else float("inf")) for eid in eids}
 
         for epoch in range(pretrain_epochs):
             model.train()
@@ -535,7 +573,7 @@ def train_model(model, dataloaders, criterion, optimizer, cfg, device, logger):
                 out = model(model_in_p)
                 experts_out = _experts_from_out(out)  # (N,E,T)
 
-                eidx = (expert_id.view(-1) - 1).clamp(min=0, max=3)
+                eidx = (expert_id.view(-1) - 1).clamp(min=0, max=n_experts-1)
                 preds = experts_out[torch.arange(experts_out.size(0), device=device), eidx, :]
 
                 loss, *_ = criterion(preds, y, expert_id=expert_id, gate_w=None)

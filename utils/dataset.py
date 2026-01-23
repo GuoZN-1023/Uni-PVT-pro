@@ -232,6 +232,51 @@ def apply_subset(df: pd.DataFrame, subset_cfg: dict | None,
     return df
 
 
+
+def _normalize_expert_ids_1based(expert_ids: np.ndarray, *, n_experts: int | None = None) -> tuple[np.ndarray, dict]:
+    """Normalize expert ids to a clean 1..E scheme.
+
+    Accepts common conventions:
+      - 0..E-1  -> shifted to 1..E
+      - 1..E    -> kept
+    Otherwise, maps sorted unique ids to 1..U (U = #unique) and returns the mapping.
+
+    Returns:
+      expert_ids_norm: np.ndarray[int64]
+      info: dict with keys: mode, mapping, n_unique
+    """
+    e = np.asarray(expert_ids).astype(np.int64).reshape(-1)
+    # ignore NaNs already filtered upstream; keep as-is otherwise
+    uniq = np.unique(e)
+    info: dict = {"mode": "as_is", "mapping": {}, "n_unique": int(len(uniq))}
+    if uniq.size == 0:
+        return e, info
+
+    mn, mx = int(uniq.min()), int(uniq.max())
+    if n_experts is not None:
+        n_experts = int(n_experts)
+
+    # 0-based common case
+    if mn == 0 and (n_experts is None or mx <= n_experts - 1):
+        e2 = e + 1
+        info.update({"mode": "shift_0_based_to_1_based"})
+        return e2.astype(np.int64), info
+
+    # already 1-based common case
+    if mn >= 1 and (n_experts is None or mx <= n_experts):
+        info.update({"mode": "already_1_based"})
+        return e.astype(np.int64), info
+
+    # fallback: remap arbitrary ids to 1..U (stable sorted unique)
+    mapping = {int(v): int(i + 1) for i, v in enumerate(sorted(uniq.tolist()))}
+    e2 = np.vectorize(lambda v: mapping[int(v)])(e).astype(np.int64)
+    info.update({"mode": "remap_arbitrary_to_1_based", "mapping": mapping})
+    # sanity if n_experts given
+    if n_experts is not None and len(mapping) > n_experts:
+        raise ValueError(f"[Dataset] expert_id has {len(mapping)} unique values, exceeds n_experts={n_experts}.")
+
+    return e2, info
+
 def _get_cfg(cfg: dict, key: str, default=None):
     """Allow both flat config and nested `data:` config."""
     if cfg is None:
@@ -557,7 +602,11 @@ class ZDataset(Dataset):
         # expert id
         if expert_col not in df.columns:
             raise ValueError(f"Required expert_col '{expert_col}' missing after preprocessing.")
-        self.expert_ids = df[expert_col].astype(int).values
+        raw_eids = df[expert_col].astype(int).values
+        n_experts_cfg = None
+        if isinstance(cfg.get('model', None), dict):
+            n_experts_cfg = (cfg.get('model') or {}).get('n_experts', None)
+        self.expert_ids, _eid_info = _normalize_expert_ids_1based(raw_eids, n_experts=n_experts_cfg)
 
         # 保存列信息（用于 train/predict 输出）
         self.anchor_col = anchor_col
@@ -645,6 +694,12 @@ class NPZDataset(Dataset):
         y_raw = np.stack([table.get_numeric(c) for c in chosen_targets], axis=1).astype(np.float32)
         expert_ids = table.get_numeric(expert_col).astype(np.int64)
 
+        # normalize expert ids to 1..E to match MoE/expert-pretrain/export conventions
+        n_experts_cfg = None
+        if isinstance(cfg.get("model", None), dict):
+            n_experts_cfg = (cfg.get("model") or {}).get("n_experts", None)
+        expert_ids, _eid_info = _normalize_expert_ids_1based(expert_ids, n_experts=n_experts_cfg)
+
         # Drop rows with NaNs in required columns
         mask = np.isfinite(X_raw).all(axis=1) & np.isfinite(y_raw).all(axis=1) & np.isfinite(expert_ids)
         idx = np.where(mask)[0].astype(np.int64)
@@ -683,7 +738,7 @@ class NPZDataset(Dataset):
         if keep_all_numeric:
             keep_num = list(table.num_cols)
         else:
-            base = set(self.feature_cols) | set(self.target_cols) | {self.expert_col}
+            base = set(feature_cols_raw) | set(chosen_targets) | {expert_col}
             # include numeric meta cols if requested
             for mc in (meta_cols or []):
                 if mc in table.num_cols:
@@ -743,6 +798,7 @@ class MolCachedNPZDataset(Dataset):
 
     def __init__(self, *, npz_path: str, cfg: dict):
         super().__init__()
+        self.is_mol_cached = True
         self.cfg = cfg
         mcfg = (cfg.get("mol_encoder") or {})
         if not bool(mcfg.get("enabled", False)):
@@ -795,7 +851,11 @@ class MolCachedNPZDataset(Dataset):
             mol_ids = table.get_numeric(self.mol_id_col)
         self.mol_ids = [str(x) for x in mol_ids.tolist()]
         self.state_tp = np.stack([table.get_numeric(self.state_cols[0]), table.get_numeric(self.state_cols[1])], axis=1).astype(np.float32)
-        self.expert_ids = table.get_numeric(self.expert_col).astype(np.int64)
+        raw_eids = table.get_numeric(self.expert_col).astype(np.int64)
+        n_experts_cfg = None
+        if isinstance(cfg.get('model', None), dict):
+            n_experts_cfg = (cfg.get('model') or {}).get('n_experts', None)
+        self.expert_ids, _eid_info = _normalize_expert_ids_1based(raw_eids, n_experts=n_experts_cfg)
         self.y = np.stack([table.get_numeric(c) for c in self.target_cols], axis=1).astype(np.float32)
 
         # drop NaNs
@@ -860,6 +920,7 @@ class MolCachedZDataset(Dataset):
 
     def __init__(self, *, csv_path: str, cfg: dict):
         super().__init__()
+        self.is_mol_cached = True
 
         self.cfg = cfg
         mcfg = (cfg.get("mol_encoder") or {})
@@ -911,7 +972,11 @@ class MolCachedZDataset(Dataset):
         # We intentionally do NOT scale state cols here.
         self.mol_ids = df[self.mol_id_col].astype(str).tolist()
         self.state_tp = df[self.state_cols].to_numpy(dtype=np.float32)  # (N,2)
-        self.expert_ids = df[self.expert_col].to_numpy(dtype=np.int64)  # (N,)
+        raw_eids = df[self.expert_col].to_numpy(dtype=np.int64)
+        n_experts_cfg = None
+        if isinstance(cfg.get('model', None), dict):
+            n_experts_cfg = (cfg.get('model') or {}).get('n_experts', None)
+        self.expert_ids, _eid_info = _normalize_expert_ids_1based(raw_eids, n_experts=n_experts_cfg)  # (N,)
         self.y = df[self.target_cols].to_numpy(dtype=np.float32)
 
         # model input dim is the cached embedding dim (D)
@@ -1082,7 +1147,51 @@ def get_dataloaders(cfg: dict):
     except Exception as e:
         print(f"[get_dataloaders] Warning: failed to compute target scales: {e}")
 
+    def _molcache_collate(batch):
+        """Pad variable-K conformer tensors to max K in batch.
+
+        We pad:
+          - z_conf with zeros (K,D)
+          - e_conf with a very large energy so softmax weight ~0
+        """
+        if not batch:
+            return {}
+
+        if not isinstance(batch[0], dict):
+            from torch.utils.data._utils.collate import default_collate
+            return default_collate(batch)
+
+        Ks = [int(b["z_conf"].shape[0]) for b in batch]
+        maxK = int(max(Ks)) if Ks else 0
+        D = int(batch[0]["z_conf"].shape[1]) if maxK > 0 else 0
+
+        z_pad = []
+        e_pad = []
+        for b, k in zip(batch, Ks):
+            z = b["z_conf"]
+            e = b["e_conf"]
+            if k < maxK:
+                pad_z = torch.zeros((maxK - k, D), dtype=z.dtype, device=z.device)
+                pad_e = torch.full((maxK - k,), 1.0e9, dtype=e.dtype, device=e.device)
+                z = torch.cat([z, pad_z], dim=0)
+                e = torch.cat([e, pad_e], dim=0)
+            z_pad.append(z)
+            e_pad.append(e)
+
+        out = {}
+        out["mol_id"] = [b.get("mol_id") for b in batch]
+        out["z_conf"] = torch.stack(z_pad, dim=0)      # (B,K,D)
+        out["e_conf"] = torch.stack(e_pad, dim=0)      # (B,K)
+        out["state"] = torch.stack([b["state"] for b in batch], dim=0)  # (B,2)
+        out["y"] = torch.stack([b["y"] for b in batch], dim=0)          # (B,T)
+        out["expert_id"] = torch.stack([b["expert_id"] for b in batch], dim=0).view(-1)
+        out["K"] = torch.tensor(Ks, dtype=torch.long)
+        return out
+
+
     bs = int((cfg.get("training", {}) or {}).get("batch_size", 256))
+
+    collate_fn = _molcache_collate if bool(getattr(train_set, 'is_mol_cached', False)) else None
 
     # DDP: shard datasets with DistributedSampler (otherwise every rank sees all data)
     import torch.distributed as dist
@@ -1094,17 +1203,16 @@ def get_dataloaders(cfg: dict):
         val_sampler = DistributedSampler(val_set, shuffle=False, drop_last=False)
         test_sampler = DistributedSampler(test_set, shuffle=False, drop_last=False)
         return {
-            "train": DataLoader(train_set, batch_size=bs, sampler=train_sampler, shuffle=False),
-            "val": DataLoader(val_set, batch_size=bs, sampler=val_sampler, shuffle=False),
-            "test": DataLoader(test_set, batch_size=bs, sampler=test_sampler, shuffle=False),
+            "train": DataLoader(train_set, batch_size=bs, sampler=train_sampler, shuffle=False, collate_fn=collate_fn),
+            "val": DataLoader(val_set, batch_size=bs, sampler=val_sampler, shuffle=False, collate_fn=collate_fn),
+            "test": DataLoader(test_set, batch_size=bs, sampler=test_sampler, shuffle=False, collate_fn=collate_fn),
         }
 
     return {
-        "train": DataLoader(train_set, batch_size=bs, shuffle=True),
-        "val": DataLoader(val_set, batch_size=bs, shuffle=False),
-        "test": DataLoader(test_set, batch_size=bs, shuffle=False),
+        "train": DataLoader(train_set, batch_size=bs, shuffle=True, collate_fn=collate_fn),
+        "val": DataLoader(val_set, batch_size=bs, shuffle=False, collate_fn=collate_fn),
+        "test": DataLoader(test_set, batch_size=bs, shuffle=False, collate_fn=collate_fn),
     }
-
 
 def make_dataset(data_path: str, cfg: dict, *, scaler_path: str | None = None, train: bool = False):
     """Dataset factory for predict/export/SHAP scripts.

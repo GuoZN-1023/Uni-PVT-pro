@@ -300,7 +300,8 @@ def main():
     rows_pred = []
     rows_metrics = []
 
-    for eid in (1, 2, 3, 4):
+    n_experts = int(((cfg.get('model') or {}) if isinstance(cfg.get('model', None), dict) else {}).get('n_experts', 4))
+    for eid in range(1, n_experts + 1):
         ckpt = os.path.join(ckpt_dir, f"best_stage1_expert{eid}.pt")
         if not os.path.exists(ckpt):
             continue

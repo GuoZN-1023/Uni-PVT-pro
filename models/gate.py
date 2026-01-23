@@ -19,7 +19,7 @@ class GateNetwork(nn.Module):
         hidden_layers,
         activation: str = "relu",
         dropout: float = 0.0,
-        n_experts: int = 4,
+        n_experts: int = 5,
     ):
         super().__init__()
 

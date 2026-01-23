@@ -157,7 +157,7 @@ def _add_stage_scatter(
     # one trace per region to get consistent legend + color
     uniq = list(dict.fromkeys(regions.tolist()))  # stable
     # prefer 1..4 ordering
-    uniq = sorted(uniq, key=lambda x: (x not in (1, 2, 3, 4), x))
+    uniq = sorted(uniq)
 
     for rid in uniq:
         mask = regions == rid

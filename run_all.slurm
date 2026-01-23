@@ -6,8 +6,8 @@
 #SBATCH -c 32                     # CPU 核（经验：每卡 6~10 核比较舒服）
 #SBATCH --mem=120G                # 内存
 #SBATCH -t 24:00:00               # 虽然 infinite，但建议先给个上限方便管理
-#SBATCH -o /home/thermo2025/Uni-PVT_results/results_gzn_20260115/logs/%x_%j.out #log日志，记得替换成自己的results路径
-#SBATCH -e /home/thermo2025/Uni-PVT_results/results_gzn_20260115/logs/%x_%j.err #log日志，记得替换成自己的results路径
+#SBATCH -o /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/logs/%x_%j.out #log日志，记得替换成自己的results路径
+#SBATCH -e /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/logs/%x_%j.err #log日志，记得替换成自己的results路径
 
 set -euo pipefail
 umask 077
