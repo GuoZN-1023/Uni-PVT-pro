@@ -53,4 +53,4 @@ export CUDA_VISIBLE_DEVICES=0
 #   --master_port="$MASTER_PORT" \
 #   run_all.py --config configs/config_total.yaml
 
-python3.10 run_all.py --config configs/config_total.yaml
+python3.10 run_all.py --config configs/config_total_H.yaml

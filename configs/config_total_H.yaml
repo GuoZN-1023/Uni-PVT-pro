@@ -1,0 +1,209 @@
+# =========================
+# Uni-PVT Training Config (Integrated)
+# - legacy scalar workflow by default
+# - Uni-PVT 2.0 (mol cache) remains a clean switch
+# =========================
+
+paths:
+  data: /home/thermo2025/Uni-PVT-Data-20260122
+  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260124/latest
+  scaler: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260124/latest/scaler.pkl
+
+  # ✅ 显式 split：直接指向你已生成好的 NPZ（不会重新预处理）
+  train_data: /home/thermo2025/Uni-PVT-Data-20260123-gzn/dataset_npz/train.npz
+  val_data:   /home/thermo2025/Uni-PVT-Data-20260123-gzn/dataset_npz/val.npz
+  test_data:  /home/thermo2025/Uni-PVT-Data-20260123-gzn/dataset_npz/test.npz
+
+data:
+  # ✅ 你要复用旧 split，就必须关掉 sampling（否则可能又去“生成/划分”）
+  sampling:
+    enabled: false
+    total_rows: 100000
+    pattern: "*.csv"
+
+  split:
+    train_ratio: 0.80
+    val_ratio: 0.10
+    test_ratio: 0.10
+    shuffle: true
+    seed: 42
+
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  limit_rows: 0
+
+expert_col: "no"
+
+feature_cols:
+  - "T_r (-)"
+  - "p_r (-)"
+  - "omega (-)"
+  - "p_c (Pa)"
+  - "T_c (K)"
+  - "mu ((J*m^3/kmol)^0.5)"
+
+targets:
+  - "Z (-)"
+  # - "phi (-)"
+  - "H (J/mol)"
+  # -"S (J/mol/K)"
+
+_expert_block: &expert_block
+  hidden_layers: [512, 256, 128, 64]
+  activation: gelu
+  dropout: 0.0
+
+experts:
+  gas: *expert_block
+  liquid: *expert_block
+  transition: *expert_block
+  supercritical:
+    hidden_layers: [512, 256, 128]
+    activation: gelu
+    dropout: 0.0
+  critical: *expert_block
+
+experts_order: ["gas", "liquid", "transition", "supercritical", "critical"]
+
+gate:
+  hidden_layers: [512, 256, 128, 64]
+  activation: relu
+  dropout: 0.05
+
+model:
+  input_dim: null
+  output_dim: null
+  n_experts: 5
+
+runtime:
+  device: auto
+  amp: { enabled: true }
+  tf32: { enabled: true }
+  compile: { enabled: false }
+
+training:
+  seed: 42
+  batch_size: 512
+  gradient_clip_norm: 0.0
+  learning_rate: 0.0005
+  weight_decay: 0.0
+
+  optimizer:
+    name: adamw
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  lr_scheduler:
+    enabled: true
+    name: cosine
+    warmup_epochs: 5
+    warmup_start_factor: 0.2
+    min_lr: 1.0e-5
+
+  pretrain_epochs: 50
+  gate_epochs: 50
+
+  finetune:
+    enabled: true
+    epochs: 80
+    unfreeze: ["gas", "liquid", "transition", "supercritical", "critical"]
+    learning_rate: 0.0007
+    min_lr: 5.0e-6
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
+    monitor: val_loss
+
+  gate_temperature_schedule:
+    enabled: true
+    start: 1.5
+    end: 0.8
+
+  eval:
+    eval_every_epochs: 1
+    log_every_steps: 50
+
+loss:
+  supervised: "mse"
+  huber_delta: 1.0
+
+  target_normalize:
+    enabled: true
+    mode: "per_target_std"
+    eps: 1.0e-12
+
+  region_weights:
+    enabled: true
+    weights: {1: 1.0, 2: 1.5, 3: 2.0, 4: 1.0, 5: 1.0}
+
+  lambda_nonneg: 3.08e-05
+  lambda_smooth: 0.0
+  lambda_extreme: 1.0
+  extreme_alpha: 4.0
+  lambda_relative: 0.0
+  lambda_entropy: -0.01
+
+pinn:
+  enabled: true
+  input_mode: auto
+
+  z_name: "Z (-)"
+  # lnphi_name: "phi (-)"
+  h_name: "H (J/mol)" 
+  # s_name: "S (J/mol/K)"
+
+  pr_feature: "p_r (-)"
+  tr_feature: "T_r (-)"
+  pc_feature: "p_c (Pa)"
+  tc_feature: "T_c (K)"
+
+  p_to_Pa: 1.0
+  R: 8.31446261815324
+  lambda_phi: 0.0005
+  lambda_H: 0.0005
+  lambda_S: 0.0005
+
+  schedule:
+    apply_in_pretrain: true
+    apply_in_gate_train: true
+    apply_in_finetune: true
+
+  compute_every_steps: 1
+  subsample_ratio: 0.25
+
+mol_encoder:
+  enabled: true
+  mol_id_col: "SMILES"
+  state_cols: ["T_r (-)", "p_r (-)"]
+
+  cache:
+    backend: "memmap"
+    dir: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache
+    meta_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/meta.json
+    z_conf_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/z_conf.npy
+    e_conf_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/e_conf.npy
+    id_map_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/mol_index.csv
+
+  boltzmann:
+    alpha: 1.0
+    energy_unit: "kcal_per_mol"
+    scale_to_kcal: 1.0
+
+  state_embedding:
+    type: "fourier_mlp"
+    out_dim: 128
+    num_frequencies: 8
+    include_logp: true
+    include_invT: true
+
+  film: { enabled: true }
+
+  phase_embedding:
+    enabled: true
+    phase_col: "no"
+    num_phases: 16
+    dim: 16

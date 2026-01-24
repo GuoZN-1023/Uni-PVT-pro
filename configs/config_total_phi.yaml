@@ -6,13 +6,13 @@
 
 paths:
   data: /home/thermo2025/Uni-PVT-Data-20260122
-  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/latest
-  scaler: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/latest/scaler.pkl
+  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260124/latest
+  scaler: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260124/latest/scaler.pkl
 
   # ✅ 显式 split：直接指向你已生成好的 NPZ（不会重新预处理）
-  train_data: /home/thermo2025/Uni-PVT-Data-20260122-gzn/dataset_npz/train.npz
-  val_data:   /home/thermo2025/Uni-PVT-Data-20260122-gzn/dataset_npz/val.npz
-  test_data:  /home/thermo2025/Uni-PVT-Data-20260122-gzn/dataset_npz/test.npz
+  train_data: /home/thermo2025/Uni-PVT-Data-20260123-gzn/dataset_npz/train.npz
+  val_data:   /home/thermo2025/Uni-PVT-Data-20260123-gzn/dataset_npz/val.npz
+  test_data:  /home/thermo2025/Uni-PVT-Data-20260123-gzn/dataset_npz/test.npz
 
 data:
   # ✅ 你要复用旧 split，就必须关掉 sampling（否则可能又去“生成/划分”）
@@ -46,7 +46,9 @@ feature_cols:
 
 targets:
   - "Z (-)"
-  - "S (J/mol/K)"
+  - "phi (-)"
+  # - "H (J/mol)"
+  # -"S (J/mol/K)"
 
 _expert_block: &expert_block
   hidden_layers: [512, 256, 128, 64]
@@ -150,7 +152,9 @@ pinn:
   input_mode: auto
 
   z_name: "Z (-)"
-  s_name: "S (J/mol/K)"
+  lnphi_name: "phi (-)"
+  # h_name: "H (J/mol)" 
+  # s_name: "S (J/mol/K)"
 
   pr_feature: "p_r (-)"
   tr_feature: "T_r (-)"
@@ -164,9 +168,9 @@ pinn:
   lambda_S: 0.0005
 
   schedule:
-    apply_in_pretrain: true
-    apply_in_gate_train: true
-    apply_in_finetune: true
+    apply_in_pretrain: false
+    apply_in_gate_train: false
+    apply_in_finetune: false
 
   compute_every_steps: 1
   subsample_ratio: 0.25
@@ -178,11 +182,11 @@ mol_encoder:
 
   cache:
     backend: "memmap"
-    dir: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache
-    meta_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/meta.json
-    z_conf_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/z_conf.npy
-    e_conf_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/e_conf.npy
-    id_map_path: /home/thermo2025/Uni-PVT-Data-20260122-gzn/mol_cache/mol_index.csv
+    dir: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache
+    meta_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/meta.json
+    z_conf_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/z_conf.npy
+    e_conf_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/e_conf.npy
+    id_map_path: /home/thermo2025/Uni-PVT-Data-20260123-gzn/mol_cache/mol_index.csv
 
   boltzmann:
     alpha: 1.0

@@ -1,0 +1,216 @@
+# =========================
+# Uni-PVT Training Config (Integrated, FULL FLOW)
+# =========================
+
+paths:
+  # 原始 per-molecule CSV 所在目录（不变）
+  data: /home/thermo2025/Uni-PVT-Data-20260122
+
+  # ✅ 明确告诉 run_all：这些就是用来抽样的分子文件目录（原则性必须加）
+  molecules_dir: /home/thermo2025/Uni-PVT-Data-20260122
+
+  # 结果目录（你原来的不变）
+  save_dir: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/latest
+  scaler: /home/thermo2025/Uni-PVT_results/results_gzn/results_gzn_20260122/latest/scaler.pkl
+
+  # ✅ 走“重新做数据”，这里必须不要锁死到旧 split（否则 prepare_dataset 会被绕开）
+  train_data: null
+  val_data: null
+  test_data: null
+
+data:
+  sampling:
+    # ✅ 打开：触发 PREP_DATASET
+    enabled: true
+    total_rows: 100000
+    pattern: "*.csv"
+
+    # ✅ 你说“要生成新的 csv 数据”，那就导出 csv
+    export_npz: true
+    delete_csv: false
+
+  split:
+    train_ratio: 0.80
+    val_ratio: 0.10
+    test_ratio: 0.10
+    shuffle: true
+    seed: 42
+
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  limit_rows: 0
+
+expert_col: "no"
+
+feature_cols:
+  - "T_r (-)"
+  - "p_r (-)"
+  - "omega (-)"
+  - "p_c (Pa)"
+  - "T_c (K)"
+  - "mu ((J*m^3/kmol)^0.5)"
+
+targets:
+  - "Z (-)"
+  - "phi (-)"
+
+_expert_block: &expert_block
+  hidden_layers: [512, 256, 128, 64]
+  activation: gelu
+  dropout: 0.0
+
+experts:
+  gas: *expert_block
+  liquid: *expert_block
+  transition: *expert_block
+  supercritical:
+    hidden_layers: [512, 256, 128]
+    activation: gelu
+    dropout: 0.0
+  critical: *expert_block
+
+experts_order: ["gas", "liquid", "transition", "supercritical", "critical"]
+
+gate:
+  hidden_layers: [512, 256, 128, 64]
+  activation: relu
+  dropout: 0.05
+
+model:
+  input_dim: null
+  output_dim: null
+  n_experts: 5
+
+runtime:
+  device: auto
+  amp: { enabled: true }
+  tf32: { enabled: true }
+  compile: { enabled: false }
+
+training:
+  seed: 42
+  batch_size: 512
+  gradient_clip_norm: 0.0
+  learning_rate: 0.0005
+  weight_decay: 0.0
+
+  optimizer:
+    name: adamw
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  lr_scheduler:
+    enabled: true
+    name: cosine
+    warmup_epochs: 5
+    warmup_start_factor: 0.2
+    min_lr: 1.0e-5
+
+  pretrain_epochs: 50
+  gate_epochs: 50
+
+  finetune:
+    enabled: true
+    epochs: 80
+    unfreeze: ["gas", "liquid", "transition", "supercritical", "critical"]
+    learning_rate: 0.0007
+    min_lr: 5.0e-6
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 0.0
+    monitor: val_loss
+
+  gate_temperature_schedule:
+    enabled: true
+    start: 1.5
+    end: 0.8
+
+  eval:
+    eval_every_epochs: 1
+    log_every_steps: 50
+
+loss:
+  supervised: "mse"
+  huber_delta: 1.0
+
+  target_normalize:
+    enabled: true
+    mode: "per_target_std"
+    eps: 1.0e-12
+
+  region_weights:
+    enabled: true
+    weights: {1: 1.0, 2: 1.5, 3: 2.0, 4: 1.0, 5: 1.0}
+
+  lambda_nonneg: 3.08e-05
+  lambda_smooth: 0.0
+  lambda_extreme: 1.0
+  extreme_alpha: 4.0
+  lambda_relative: 0.0
+  lambda_entropy: -0.01
+
+pinn:
+  enabled: true
+  input_mode: scaled
+
+  z_name: "Z (-)"
+  lnphi_name: "phi (-)"
+
+  pr_feature: "p_r (-)"
+  tr_feature: "T_r (-)"
+  pc_feature: "p_c (Pa)"
+  tc_feature: "T_c (K)"
+
+  p_to_Pa: 1.0
+  R: 8.31446261815324
+  lambda_phi: 0.0005
+  lambda_H: 0.0005
+  lambda_S: 0.0005
+
+  schedule:
+    apply_in_pretrain: true
+    apply_in_gate_train: true
+    apply_in_finetune: true
+
+  compute_every_steps: 1
+  subsample_ratio: 0.25
+
+mol_encoder:
+  enabled: true
+  mol_id_col: "SMILES"
+  smiles_col: "SMILES"
+  state_cols: ["T_r (-)", "p_r (-)"]
+
+  cache:
+    backend: "memmap"
+    # ✅ 关键：不再固定到一个“常驻目录”，交给 run_all 自动放到每次 exp_dir/mol_cache
+    # 这样每次都会重新生成，不会被旧文件短路
+    dir: null
+    meta_path: null
+    z_conf_path: null
+    e_conf_path: null
+    id_map_path: null
+
+  boltzmann:
+    alpha: 1.0
+    energy_unit: "kcal_per_mol"
+    scale_to_kcal: 1.0
+
+  state_embedding:
+    type: "fourier_mlp"
+    out_dim: 128
+    num_frequencies: 8
+    include_logp: true
+    include_invT: true
+
+  film: { enabled: true }
+
+  phase_embedding:
+    enabled: true
+    phase_col: "no"
+    num_phases: 16
+    dim: 16

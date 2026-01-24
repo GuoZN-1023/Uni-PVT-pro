@@ -17,8 +17,8 @@ def run_subprocess(cmd, stdout_path=None, stderr_path=None, cwd=None):
     小工具：运行子进程。
     如果 stdout_path/stderr_path 提供，则将输出重定向到文件，避免刷屏。
     """
-    stdout = '/home/thermo2025/Uni-PVT_results/results_ja/results_ja_20260124/logs'
-    stderr = '/home/thermo2025/Uni-PVT_results/results_ja/results_ja_20260124/logs'
+    stdout = None
+    stderr = None
     if stdout_path is not None:
         os.makedirs(os.path.dirname(stdout_path), exist_ok=True)
         stdout = open(stdout_path, "a", encoding="utf-8")
@@ -190,7 +190,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="config/config.yaml",
+        default="/home/thermo2025/Uni-PVT-pro-0123-v1.0/configs/config_total_ja.yaml",
         help="基础配置文件路径（会作为模板拷贝）",
     )
     parser.add_argument(
@@ -202,7 +202,7 @@ def main():
     parser.add_argument(
         "--optuna-dir",
         type=str,
-        default="optuna_results",
+        default="/home/thermo2025/Uni-PVT_results/results_ja/results_ja_20260124",
         help="所有 trial 结果保存的根目录",
     )
     parser.add_argument(
